@@ -4,9 +4,8 @@ import plotly.express as px
 from supabase import create_client, Client
 import os
 
-# ==========================================
 # 1. CONFIGURAÇÃO DA PÁGINA E BRANDING
-# ==========================================
+
 NOME_APLICACAO = "Painel Master Higimed"
 CAMINHO_LOGO = "logo.webp"  # Certifique-se de que o arquivo 'logo.webp' está na raiz do seu projeto no Git
 
@@ -26,10 +25,8 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-
-# ==========================================
 # 2. CONEXÃO COM O SUPABASE (BD)
-# ==========================================
+
 @st.cache_resource
 def iniciar_conexao_supabase() -> Client:
     """Inicializa e mantém em cache a conexão com o Supabase de forma segura."""
@@ -51,10 +48,8 @@ def iniciar_conexao_supabase() -> Client:
 
 supabase = iniciar_conexao_supabase()
 
-
-# ==========================================
 # 3. INJEÇÃO DE DADOS (UPLOAD CSV)
-# ==========================================
+
 def processar_e_injetar_csv(file_upload):
     """
     Lê o CSV enviado, insere novos clientes no BD, mapeia os IDs
@@ -90,20 +85,30 @@ def processar_e_injetar_csv(file_upload):
 
         mapa_clientes = dict(zip(df_clientes_bd['nome'], df_clientes_bd['id']))
 
-        # --- B. Mapear Status IDs ---
+        # --- B. Mapear Status IDs (Resiliente e Flexível) ---
         res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
         df_status_bd = pd.DataFrame(res_status.data)
         
         mapa_status = {}
-        for _, row in df_status_bd.iterrows():
-            chave_completa = f"{row['codigo']}-{row['descricao']}"
-            mapa_status[chave_completa] = row['id']
+        if not df_status_bd.empty:
+            for _, row in df_status_bd.iterrows():
+                cod = str(row['codigo']).strip()
+                desc = str(row['descricao']).strip()
+                status_id = row['id']
+
+                # Aceita diferentes padrões de escrita que podem vir do CSV
+                mapa_status[f"{cod}-{desc}"] = status_id
+                mapa_status[cod] = status_id
+                mapa_status[desc] = status_id
 
         # --- C. Preparar Payload ---
         df['aberto_em'] = pd.to_datetime(df['AbertoEm'], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%dT%H:%M:%S')
         df['volumes'] = pd.to_numeric(df['Volumes'], errors='coerce').fillna(0).astype(int)
         df['cliente_id'] = df['Cliente'].map(mapa_clientes)
-        df['status_id'] = df['Status'].map(mapa_status)
+        
+        # Limpa espaços extras no campo de Status do CSV antes do de-para
+        df['status_limpo'] = df['Status'].astype(str).str.strip()
+        df['status_id'] = df['status_limpo'].map(mapa_status)
 
         payload_pedidos = []
         for _, row in df.iterrows():
@@ -131,10 +136,8 @@ def processar_e_injetar_csv(file_upload):
     except Exception as e:
         st.error(f"❌ Erro durante o processamento do CSV: {str(e)}")
 
-
-# ==========================================
 # 4. CARREGAMENTO DOS DADOS PARA O DASHBOARD
-# ==========================================
+
 @st.cache_data(ttl=60)
 def carregar_dados_painel() -> pd.DataFrame:
     """Busca os dados relacionados via Supabase API utilizando JOIN normalizado."""
@@ -169,11 +172,9 @@ def carregar_dados_painel() -> pd.DataFrame:
     except Exception as e:
         st.error(f"Erro ao conectar ao Supabase: {str(e)}")
         return pd.DataFrame()
-
-
-# ==========================================
+        
 # 5. COMPONENTES VISUAIS
-# ==========================================
+
 def renderizar_blocos_status(df: pd.DataFrame, status_list: list):
     """Renderiza os botões clicáveis para filtrar o painel."""
     st.subheader("Painel de Acompanhamento de Separações")
@@ -253,10 +254,8 @@ def renderizar_graficos(df: pd.DataFrame, status_ativo: str):
         else:
             st.info("Sem registro de volumes para os pedidos deste status.")
 
-
-# ==========================================
 # 6. PONTO DE ENTRADA (MAIN)
-# ==========================================
+
 def main():
     # --- BARRA LATERAL (SIDEBAR) ---
     if os.path.exists(CAMINHO_LOGO):
