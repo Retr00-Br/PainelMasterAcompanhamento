@@ -52,25 +52,27 @@ supabase = iniciar_conexao_supabase()
 
 def processar_e_injetar_csv(file_upload):
     """
-    Lê o CSV enviado, sincroniza clientes e status com o Supabase,
-    e faz a injeção em lote na tabela 'pedidos'.
+    Lê o CSV, faz a correspondência com Clientes e Status e insere os Pedidos no Supabase.
+    Exibe diagnósticos detalhados caso encontre inconsistências.
     """
     try:
-        # 1. Leitura do CSV
+        # 1. Leitura do arquivo CSV com encoding resiliente
         try:
             df = pd.read_csv(file_upload, encoding='latin1', sep=None, engine='python')
         except Exception:
             file_upload.seek(0)
             df = pd.read_csv(file_upload, encoding='utf-8', sep=None, engine='python')
 
-        # Limpeza no nome das colunas
+        # Normalização dos nomes das colunas
         df.columns = [str(col).strip() for col in df.columns]
 
-        st.info(f"⏳ Processando {len(df)} registros do arquivo...")
+        st.info(f"⏳ Lendo {len(df)} registros do arquivo CSV...")
 
-        # --- A. GERENCIAMENTO DE CLIENTES ---
-        clientes_unicos = [str(c).strip() for c in df['Cliente'].dropna().unique() if str(c).strip()]
-        
+        # --- A. SINCRONIZAÇÃO DE CLIENTES ---
+        # Normalização de strings para evitar falhas por espaços em branco
+        df['Cliente_Clean'] = df['Cliente'].astype(str).str.strip()
+        clientes_unicos = [c for c in df['Cliente_Clean'].unique() if c and c.lower() != 'nan']
+
         res_clientes = supabase.table('clientes').select('id, nome').execute()
         df_clientes_bd = pd.DataFrame(res_clientes.data)
 
@@ -82,19 +84,21 @@ def processar_e_injetar_csv(file_upload):
             novos_clientes = clientes_unicos
 
         if novos_clientes:
+            st.write(f"➕ Cadastrando {len(novos_clientes)} novos clientes no banco...")
             payload_clientes = [{'nome': c} for c in novos_clientes]
             supabase.table('clientes').insert(payload_clientes).execute()
-            # Atualiza lista do BD
+            
+            # Recarrega a lista atualizada de clientes
             res_clientes = supabase.table('clientes').select('id, nome').execute()
             df_clientes_bd = pd.DataFrame(res_clientes.data)
             df_clientes_bd['nome_clean'] = df_clientes_bd['nome'].astype(str).str.strip()
 
         mapa_clientes = dict(zip(df_clientes_bd['nome_clean'], df_clientes_bd['id']))
 
-        # --- B. MAPEAMENTO RIGOROSO DE STATUS (Tratando ID 0) ---
+        # --- B. MAPEAMENTO DE STATUS ---
         res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
         df_status_bd = pd.DataFrame(res_status.data)
-        
+
         mapa_status = {}
         if not df_status_bd.empty:
             for _, row in df_status_bd.iterrows():
@@ -102,42 +106,48 @@ def processar_e_injetar_csv(file_upload):
                 cod = str(row['codigo']).strip() if pd.notna(row['codigo']) else ""
                 desc = str(row['descricao']).strip() if pd.notna(row['descricao']) else ""
 
-                # Mapeia por chave composta, código isolado e descrição
-                if cod and desc:
-                    mapa_status[f"{cod}-{desc}"] = s_id
                 if cod:
                     mapa_status[cod] = s_id
                 if desc:
                     mapa_status[desc] = s_id
+                if cod and desc:
+                    mapa_status[f"{cod}-{desc}"] = s_id
 
-        # --- C. CONSTRUÇÃO DO PAYLOAD ---
+        # --- C. CONSTRUÇÃO DO PAYLOAD E VALIDAÇÃO ---
         payload_pedidos = []
-        
-        for _, row in df.iterrows():
-            cliente_str = str(row.get('Cliente', '')).strip()
-            status_str = str(row.get('Status', '')).strip()
-            pedido_val = row.get('Pedido')
+        falhas_cliente = set()
+        falhas_status = set()
 
-            # Pula linhas sem número de pedido
+        for _, row in df.iterrows():
+            pedido_val = row.get('Pedido')
+            cliente_str = str(row.get('Cliente_Clean', '')).strip()
+            status_str = str(row.get('Status', '')).strip()
+
             if pd.isna(pedido_val):
                 continue
 
-            # Busca IDs
+            # Mapeamento do Cliente
             c_id = mapa_clientes.get(cliente_str)
-            
-            # De-para do status flexível
+
+            # Mapeamento de Status
             s_id = mapa_status.get(status_str)
             if s_id is None and '-' in status_str:
                 cod_extraido = status_str.split('-')[0].strip()
                 s_id = mapa_status.get(cod_extraido)
 
-            # Validação estrita (considerando que s_id pode ser 0)
+            # Registra inconsistências se houver
+            if c_id is None:
+                falhas_cliente.add(cliente_str)
+            if s_id is None:
+                falhas_status.add(status_str)
+
+            # Só adiciona se AMBOS existirem (notando que s_id pode ser 0)
             if c_id is not None and s_id is not None:
                 # Tratamento da data
                 data_parsed = pd.to_datetime(row.get('AbertoEm'), dayfirst=True, errors='coerce')
                 data_iso = data_parsed.strftime('%Y-%m-%dT%H:%M:%S') if pd.notna(data_parsed) else None
 
-                # Tratamento de volumes (NaN vira 0)
+                # Tratamento de volumes
                 vol_val = pd.to_numeric(row.get('Volumes'), errors='coerce')
                 vol_int = int(vol_val) if pd.notna(vol_val) else 0
 
@@ -149,7 +159,13 @@ def processar_e_injetar_csv(file_upload):
                     'volumes': vol_int
                 })
 
-        # --- D. INJEÇÃO EM LOTES NO SUPABASE ---
+        # --- D. EXIBIÇÃO DE ERROS DE DE-PARA (SE HOUVER) ---
+        if falhas_cliente:
+            st.error(f"❌ {len(falhas_cliente)} cliente(s) do CSV não foram encontrados/cadastrados: {list(falhas_cliente)[:5]}")
+        if falhas_status:
+            st.error(f"❌ {len(falhas_status)} status do CSV não foram mapeados: {list(falhas_status)}")
+
+        # --- E. INJEÇÃO DOS DADOS EM LOTES ---
         if payload_pedidos:
             tamanho_lote = 100
             for i in range(0, len(payload_pedidos), tamanho_lote):
@@ -160,11 +176,11 @@ def processar_e_injetar_csv(file_upload):
             st.cache_data.clear()
             st.rerun()
         else:
-            st.warning("⚠️ Nenhum pedido válido encontrado para injeção. Verifique a associação dos clientes e status.")
+            st.warning("⚠️ Nenhum pedido passou na validação de de-para para injeção.")
 
     except Exception as e:
         st.error(f"❌ Erro durante o processamento do CSV: {str(e)}")
-
+        
 # 4. CARREGAMENTO DOS DADOS PARA O DASHBOARD
 
 @st.cache_data(ttl=60)
