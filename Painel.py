@@ -4,15 +4,15 @@ import plotly.express as px
 from supabase import create_client, Client
 import os
 
-
+# ==========================================
 # 1. CONFIGURAÇÃO DA PÁGINA E BRANDING
-
+# ==========================================
 NOME_APLICACAO = "Painel Master Higimed"
-URL_LOGO_MASTER_HIGIMED = "https://via.placeholder.com/200x60.png?text=Master+Higimed"  # Substitua pelo link direto/caminho local da logo
+CAMINHO_LOGO = "logo.webp"  # Certifique-se de que o arquivo 'logo.webp' está na raiz do seu projeto no Git
 
 st.set_page_config(
     page_title=NOME_APLICACAO,
-    page_icon="📦",
+    page_icon=CAMINHO_LOGO if os.path.exists(CAMINHO_LOGO) else "📦",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -27,38 +27,46 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-
+# ==========================================
 # 2. CONEXÃO COM O SUPABASE (BD)
-
-# Recomenda-se colocar as chaves no arquivo .streamlit/secrets.toml
-SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", "https://seu-projeto.supabase.co"))
-SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", "sua-chave-anon-key"))
-
+# ==========================================
 @st.cache_resource
 def iniciar_conexao_supabase() -> Client:
-    """Inicializa o cliente do Supabase."""
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+    """Inicializa e mantém em cache a conexão com o Supabase de forma segura."""
+    try:
+        # Busca no st.secrets ou em variáveis de ambiente
+        if "supabase" in st.secrets:
+            url = st.secrets["supabase"]["SUPABASE_URL"]
+            key = st.secrets["supabase"]["SUPABASE_KEY"]
+        else:
+            url = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
+            key = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
+
+        # Trata barras residuais no final da URL para evitar erro PGRST125
+        url_limpa = url.rstrip("/")
+        return create_client(url_limpa, key)
+    except Exception as e:
+        st.error(f"Erro ao carregar credenciais do Supabase: {str(e)}")
+        st.stop()
 
 supabase = iniciar_conexao_supabase()
 
 
-
-# 3. UPLOAD CSV
-
+# ==========================================
+# 3. INJEÇÃO DE DADOS (UPLOAD CSV)
+# ==========================================
 def processar_e_injetar_csv(file_upload):
     """
     Lê o CSV enviado, insere novos clientes no BD, mapeia os IDs
     e injeta os pedidos na tabela 'pedidos' do Supabase.
     """
     try:
-        # Tenta ler o CSV com a codificação correta
         try:
             df = pd.read_csv(file_upload, encoding='latin1', sep=None, engine='python')
         except Exception:
             file_upload.seek(0)
             df = pd.read_csv(file_upload, encoding='utf-8', sep=None, engine='python')
 
-        # Normalização dos nomes das colunas esperadas
         df.columns = [col.strip() for col in df.columns]
 
         st.info(f"⏳ Processando {len(df)} registros do arquivo...")
@@ -66,7 +74,6 @@ def processar_e_injetar_csv(file_upload):
         # --- A. Garantir/Inserir Clientes Únicos ---
         clientes_unicos = df['Cliente'].dropna().unique().tolist()
         
-        # Busca clientes já cadastrados
         res_clientes = supabase.table('clientes').select('id, nome').execute()
         df_clientes_bd = pd.DataFrame(res_clientes.data)
 
@@ -78,7 +85,6 @@ def processar_e_injetar_csv(file_upload):
         if novos_clientes:
             payload_clientes = [{'nome': c} for c in novos_clientes]
             supabase.table('clientes').insert(payload_clientes).execute()
-            # Recarrega a tabela de clientes para pegar os novos IDs
             res_clientes = supabase.table('clientes').select('id, nome').execute()
             df_clientes_bd = pd.DataFrame(res_clientes.data)
 
@@ -88,13 +94,12 @@ def processar_e_injetar_csv(file_upload):
         res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
         df_status_bd = pd.DataFrame(res_status.data)
         
-        # Cria um mapeamento concatenado (ex: "10-Ag.Inicio Operação" -> ID)
         mapa_status = {}
         for _, row in df_status_bd.iterrows():
             chave_completa = f"{row['codigo']}-{row['descricao']}"
             mapa_status[chave_completa] = row['id']
 
-        # --- C. Preparar Payload da Tabela Pedidos ---
+        # --- C. Preparar Payload ---
         df['aberto_em'] = pd.to_datetime(df['AbertoEm'], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%dT%H:%M:%S')
         df['volumes'] = pd.to_numeric(df['Volumes'], errors='coerce').fillna(0).astype(int)
         df['cliente_id'] = df['Cliente'].map(mapa_clientes)
@@ -111,16 +116,15 @@ def processar_e_injetar_csv(file_upload):
                     'volumes': int(row['volumes'])
                 })
 
-        # --- D. Injeção no Banco de Dados ---
+        # --- D. Injeção no Banco de Dados em Lotes ---
         if payload_pedidos:
-            # Insere em lotes de 100 para evitar timeout de API
             tamanho_lote = 100
             for i in range(0, len(payload_pedidos), tamanho_lote):
                 lote = payload_pedidos[i:i + tamanho_lote]
                 supabase.table('pedidos').insert(lote).execute()
 
             st.success(f"✅ Sucesso! {len(payload_pedidos)} pedidos injetados no Supabase.")
-            st.cache_data.clear()  # Limpa o cache para recarregar o painel
+            st.cache_data.clear()
         else:
             st.warning("⚠️ Nenhum pedido válido encontrado para injeção.")
 
@@ -128,37 +132,37 @@ def processar_e_injetar_csv(file_upload):
         st.error(f"❌ Erro durante o processamento do CSV: {str(e)}")
 
 
-
-# 4. CARREGAMENTO DOS DADOS PARA O DASHBOARD (BI)
-
+# ==========================================
+# 4. CARREGAMENTO DOS DADOS PARA O DASHBOARD
+# ==========================================
 @st.cache_data(ttl=60)
 def carregar_dados_painel() -> pd.DataFrame:
-    """Busca os dados relacioandos via Supabase API."""
+    """Busca os dados relacionados via Supabase API utilizando JOIN normalizado."""
     try:
-        # Consulta com JOIN entre Pedidos, Clientes e Status
-        query = """
-            id,
-            numero_pedido,
-            aberto_em,
-            volumes,
-            clientes (nome),
-            status_separacao (codigo, descricao)
-        """
-        response = supabase.table('pedidos').select(query).execute()
-        
-        if not response.data:
+        # Query simplificada para evitar falhas de interpretação na rota API
+        res = supabase.table('pedidos').select(
+            'id, numero_pedido, aberto_em, volumes, clientes(nome), status_separacao(codigo, descricao)'
+        ).execute()
+
+        if not res.data:
             return pd.DataFrame()
 
-        # Normaliza a estrutura JSON do JOIN para colunas simples
         registros = []
-        for item in response.data:
+        for item in res.data:
+            cliente_obj = item.get('clientes') or {}
+            status_obj = item.get('status_separacao') or {}
+
+            nome_cliente = cliente_obj.get('nome', 'N/I') if isinstance(cliente_obj, dict) else 'N/I'
+            cod_status = status_obj.get('codigo', '00') if isinstance(status_obj, dict) else '00'
+            desc_status = status_obj.get('descricao', 'Indefinido') if isinstance(status_obj, dict) else 'Indefinido'
+
             registros.append({
-                'Pedido': item['numero_pedido'],
-                'AbertoEm': item['aberto_em'],
-                'Cliente': item['clientes']['nome'] if item.get('clientes') else 'N/I',
-                'Volumes': item['volumes'],
-                'Status_Codigo': item['status_separacao']['codigo'] if item.get('status_separacao') else '00',
-                'Status': f"{item['status_separacao']['codigo']}-{item['status_separacao']['descricao']}" if item.get('status_separacao') else 'Indefinido'
+                'Pedido': item.get('numero_pedido'),
+                'AbertoEm': item.get('aberto_em'),
+                'Cliente': nome_cliente,
+                'Volumes': item.get('volumes', 0),
+                'Status_Codigo': cod_status,
+                'Status': f"{cod_status}-{desc_status}"
             })
 
         return pd.DataFrame(registros)
@@ -167,11 +171,11 @@ def carregar_dados_painel() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-
-# 5. COMPONENTES VISUAIS E PAINEL MASTER
-
+# ==========================================
+# 5. COMPONENTES VISUAIS
+# ==========================================
 def renderizar_blocos_status(df: pd.DataFrame, status_list: list):
-    """Renderiza os botões clicáveis estilo MTC para filtrar o painel."""
+    """Renderiza os botões clicáveis para filtrar o painel."""
     st.subheader("Painel de Acompanhamento de Separações")
     
     if 'status_selecionado' not in st.session_state:
@@ -179,7 +183,6 @@ def renderizar_blocos_status(df: pd.DataFrame, status_list: list):
 
     colunas = st.columns(len(status_list) + 1)
 
-    # Botão "Todos"
     with colunas[0]:
         qtd_total = len(df)
         tipo = "primary" if st.session_state.status_selecionado == "Todos" else "secondary"
@@ -187,7 +190,6 @@ def renderizar_blocos_status(df: pd.DataFrame, status_list: list):
             st.session_state.status_selecionado = "Todos"
             st.rerun()
 
-    # Botões dinâmicos por Status do BD
     for idx, status in enumerate(status_list, start=1):
         qtd = len(df[df['Status'] == status]) if not df.empty else 0
         with colunas[idx]:
@@ -198,7 +200,7 @@ def renderizar_blocos_status(df: pd.DataFrame, status_list: list):
 
 
 def renderizar_graficos(df: pd.DataFrame, status_ativo: str):
-    """Exibe o gráfico de volumetria/quantidade por cliente para o status selecionado."""
+    """Exibe os gráficos de pedidos e volumetria por cliente."""
     col1, col2 = st.columns(2)
 
     with col1:
@@ -252,13 +254,16 @@ def renderizar_graficos(df: pd.DataFrame, status_ativo: str):
             st.info("Sem registro de volumes para os pedidos deste status.")
 
 
-
-# 6. PONTO DE ENTRADA 
-
+# ==========================================
+# 6. PONTO DE ENTRADA (MAIN)
+# ==========================================
 def main():
     # --- BARRA LATERAL (SIDEBAR) ---
-    st.sidebar.image(URL_LOGO_MASTER_HIGIMED, use_container_width=True)
-    st.sidebar.title(NOME_APLICACAO)
+    if os.path.exists(CAMINHO_LOGO):
+        st.sidebar.image(CAMINHO_LOGO, use_container_width=True)
+    else:
+        st.sidebar.title(NOME_APLICACAO)
+
     st.sidebar.markdown("---")
 
     # Módulo de Injeção de Dados (Upload)
@@ -272,15 +277,21 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.caption("Master Higimed © 2026 - Gestão de Operações")
 
-    # --- PÁGINA PRINCIPAL ---
-    st.title(f"🏢 {NOME_APLICACAO}")
-    st.markdown("Acompanhamento em tempo real dos pedidos de separação e fluxo logístico.")
+    # --- PÁGINA PRINCIPAL COM LOGO ---
+    col_logo, col_titulo = st.columns([1, 4])
+    with col_logo:
+        if os.path.exists(CAMINHO_LOGO):
+            st.image(CAMINHO_LOGO, width=150)
+    with col_titulo:
+        st.title(NOME_APLICACAO)
+        st.caption("Acompanhamento em tempo real dos pedidos de separação e fluxo logístico.")
+
     st.markdown("---")
 
     # Carrega os dados atualizados do banco
     df_pedidos = carregar_dados_painel()
 
-    # Mapeia lista de status únicos do banco
+    # Mapeia lista de status para a esteira
     lista_status = [
         "00-Sem Saldo",
         "10-Ag.Inicio Operação",
