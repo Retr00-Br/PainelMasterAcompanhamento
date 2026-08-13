@@ -1,0 +1,27 @@
+# Proteção de arquivos sensíveis
+.streamlit/secrets.toml
+
+# Ambiente Virtual Python
+.venv/
+venv/
+ENV/
+env/
+
+# Arquivos de Cache e Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Arquivos de Dados Locais e Logs
+*.csv
+*.xlsx
+*.log
+
+# Arquivos do Sistema Operacional
+.DS_Store
+Thumbs.db
+
+# Configurações do IDE 
+.idea/
+.vscode/
