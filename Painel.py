@@ -257,7 +257,7 @@ def renderizar_graficos(df: pd.DataFrame, status_ativo: str):
 
 def main():
     # --- BARRA LATERAL (SIDEBAR) ---
-    st.sidebar.image(URL_LOGO_MASTER_HIGIMED, use_column_width=True)
+    st.sidebar.image(URL_LOGO_MASTER_HIGIMED, use_container_width=True)
     st.sidebar.title(NOME_APLICACAO)
     st.sidebar.markdown("---")
 
