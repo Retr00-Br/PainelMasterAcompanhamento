@@ -80,12 +80,13 @@ def processar_e_injetar_csv(file_upload):
         if novos_clientes:
             payload_clientes = [{'nome': c} for c in novos_clientes]
             supabase.table('clientes').insert(payload_clientes).execute()
+            # Recarrega mapa com novos registros inseridos
             res_clientes = supabase.table('clientes').select('id, nome').execute()
             df_clientes_bd = pd.DataFrame(res_clientes.data)
 
         mapa_clientes = dict(zip(df_clientes_bd['nome'], df_clientes_bd['id']))
 
-        # --- B. Mapear Status IDs (Resiliente e Flexível) ---
+        # --- B. Mapear Status IDs (Busca Multi-Padrão) ---
         res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
         df_status_bd = pd.DataFrame(res_status.data)
         
@@ -94,31 +95,41 @@ def processar_e_injetar_csv(file_upload):
             for _, row in df_status_bd.iterrows():
                 cod = str(row['codigo']).strip()
                 desc = str(row['descricao']).strip()
-                status_id = row['id']
+                status_id = int(row['id'])
 
-                # Aceita diferentes padrões de escrita que podem vir do CSV
+                # Mapeia todas as combinações possíveis para não falhar
                 mapa_status[f"{cod}-{desc}"] = status_id
                 mapa_status[cod] = status_id
                 mapa_status[desc] = status_id
 
         # --- C. Preparar Payload ---
         df['aberto_em'] = pd.to_datetime(df['AbertoEm'], dayfirst=True, errors='coerce').dt.strftime('%Y-%m-%dT%H:%M:%S')
-        df['volumes'] = pd.to_numeric(df['Volumes'], errors='coerce').fillna(0).astype(int)
+        df['volumes_clean'] = pd.to_numeric(df['Volumes'], errors='coerce').fillna(0).astype(int)
         df['cliente_id'] = df['Cliente'].map(mapa_clientes)
-        
-        # Limpa espaços extras no campo de Status do CSV antes do de-para
-        df['status_limpo'] = df['Status'].astype(str).str.strip()
-        df['status_id'] = df['status_limpo'].map(mapa_status)
+
+        # Função auxiliar para encontrar o ID do status
+        def buscar_status_id(val):
+            val_str = str(val).strip()
+            if val_str in mapa_status:
+                return mapa_status[val_str]
+            # Se vier '10-Ag.Inicio Operação', tenta extrair só o código '10'
+            if '-' in val_str:
+                codigo_extraido = val_str.split('-')[0].strip()
+                if codigo_extraido in mapa_status:
+                    return mapa_status[codigo_extraido]
+            return None
+
+        df['status_id'] = df['Status'].apply(buscar_status_id)
 
         payload_pedidos = []
         for _, row in df.iterrows():
-            if pd.notna(row['cliente_id']) and pd.notna(row['status_id']):
+            if pd.notna(row['cliente_id']) and pd.notna(row['status_id']) and pd.notna(row['Pedido']):
                 payload_pedidos.append({
                     'numero_pedido': int(row['Pedido']),
                     'cliente_id': int(row['cliente_id']),
                     'status_id': int(row['status_id']),
-                    'aberto_em': row['aberto_em'],
-                    'volumes': int(row['volumes'])
+                    'aberto_em': str(row['aberto_em']),
+                    'volumes': int(row['volumes_clean'])
                 })
 
         # --- D. Injeção no Banco de Dados em Lotes ---
@@ -130,8 +141,9 @@ def processar_e_injetar_csv(file_upload):
 
             st.success(f"✅ Sucesso! {len(payload_pedidos)} pedidos injetados no Supabase.")
             st.cache_data.clear()
+            st.rerun()
         else:
-            st.warning("⚠️ Nenhum pedido válido encontrado para injeção.")
+            st.warning("⚠️ Nenhum pedido válido encontrado para injeção. Verifique se os status cadastrados no Supabase coincidem com os códigos do CSV.")
 
     except Exception as e:
         st.error(f"❌ Erro durante o processamento do CSV: {str(e)}")
