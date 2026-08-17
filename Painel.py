@@ -95,7 +95,7 @@ def processar_e_injetar_csv(file_upload):
 
         mapa_clientes = dict(zip(df_clientes_bd['nome_clean'], df_clientes_bd['id']))
 
-        # --- B. MAPEAMENTO DE STATUS ---
+# --- B. MAPEAMENTO DE STATUS ---
         res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
         df_status_bd = pd.DataFrame(res_status.data)
 
@@ -107,48 +107,53 @@ def processar_e_injetar_csv(file_upload):
                 desc = str(row['descricao']).strip() if pd.notna(row['descricao']) else ""
 
                 if cod:
-                    mapa_status[cod] = s_id
+                    mapa_status[cod.lower()] = s_id
                 if desc:
-                    mapa_status[desc] = s_id
+                    mapa_status[desc.lower()] = s_id
                 if cod and desc:
-                    mapa_status[f"{cod}-{desc}"] = s_id
+                    mapa_status[f"{cod}-{desc}".lower()] = s_id
 
         # --- C. CONSTRUÇÃO DO PAYLOAD E VALIDAÇÃO ---
         payload_pedidos = []
         falhas_cliente = set()
         falhas_status = set()
 
-        for _, row in df.iterrows():
-            pedido_val = row.get('Pedido')
-            cliente_str = str(row.get('Cliente_Clean', '')).strip()
-            status_str = str(row.get('Status', '')).strip()
+        # Garante busca de colunas sem sensibilidade a maiúsculas/minúsculas
+        cols_lower = {col.lower(): col for col in df.columns}
+        col_pedido = cols_lower.get('pedido') or cols_lower.get('numero_pedido') or 'Pedido'
+        col_status = cols_lower.get('status') or 'Status'
+        col_data = cols_lower.get('abertoem') or cols_lower.get('aberto_em') or 'AbertoEm'
+        col_vol = cols_lower.get('volumes') or 'Volumes'
 
-            if pd.isna(pedido_val):
+        for _, row in df.iterrows():
+            pedido_val = row.get(col_pedido)
+            cliente_str = str(row.get('Cliente_Clean', '')).strip()
+            status_str = str(row.get(col_status, '')).strip()
+
+            if pd.isna(pedido_val) or str(pedido_val).strip() == '':
                 continue
 
             # Mapeamento do Cliente
             c_id = mapa_clientes.get(cliente_str)
 
-            # Mapeamento de Status
-            s_id = mapa_status.get(status_str)
-            if s_id is None and '-' in status_str:
-                cod_extraido = status_str.split('-')[0].strip()
+            # Mapeamento de Status tolerante
+            status_limpo = status_str.lower()
+            s_id = mapa_status.get(status_limpo)
+            
+            if s_id is None and '-' in status_limpo:
+                cod_extraido = status_limpo.split('-')[0].strip()
                 s_id = mapa_status.get(cod_extraido)
 
-            # Registra inconsistências se houver
             if c_id is None:
                 falhas_cliente.add(cliente_str)
             if s_id is None:
                 falhas_status.add(status_str)
 
-            # Só adiciona se AMBOS existirem (notando que s_id pode ser 0)
             if c_id is not None and s_id is not None:
-                # Tratamento da data
-                data_parsed = pd.to_datetime(row.get('AbertoEm'), dayfirst=True, errors='coerce')
+                data_parsed = pd.to_datetime(row.get(col_data), dayfirst=True, errors='coerce')
                 data_iso = data_parsed.strftime('%Y-%m-%dT%H:%M:%S') if pd.notna(data_parsed) else None
 
-                # Tratamento de volumes
-                vol_val = pd.to_numeric(row.get('Volumes'), errors='coerce')
+                vol_val = pd.to_numeric(row.get(col_vol), errors='coerce')
                 vol_int = int(vol_val) if pd.notna(vol_val) else 0
 
                 payload_pedidos.append({
