@@ -52,10 +52,10 @@ supabase = iniciar_conexao_supabase()
 
 def processar_e_injetar_csv(file_upload):
     """
-    Lê o CSV tratado, sincroniza Clientes/Status e faz a injeção no Supabase.
+    Lê o CSV tratado, sincroniza Clientes e Status reais do Supabase e injeta os Pedidos.
     """
     try:
-        # 1. Leitura do arquivo tratando BOM (\ufeff) e separadores
+        # 1. Leitura do arquivo tratando o caractere invisível BOM (\ufeff)
         try:
             file_upload.seek(0)
             df = pd.read_csv(file_upload, encoding='utf-8-sig', sep=None, engine='python')
@@ -63,23 +63,44 @@ def processar_e_injetar_csv(file_upload):
             file_upload.seek(0)
             df = pd.read_csv(file_upload, encoding='latin1', sep=None, engine='python')
 
-        # Normalização dos nomes de colunas
+        # Normalização de cabeçalhos
         df.columns = [str(col).replace('\ufeff', '').strip() for col in df.columns]
         st.info(f"⏳ Lendo {len(df)} registros do arquivo CSV...")
 
         cols_lower = {col.lower(): col for col in df.columns}
 
-        # Identificação inteligente das colunas do CSV tratado
+        # Identificação de colunas do CSV
         col_cliente = cols_lower.get('cliente_nome') or cols_lower.get('cliente')
         col_pedido = cols_lower.get('pv_limpo') or cols_lower.get('pv') or cols_lower.get('numero_pedido') or cols_lower.get('pedido')
         col_data = cols_lower.get('emissão pv_data') or cols_lower.get('emissão pv') or cols_lower.get('abertoem')
         col_vol = cols_lower.get('volume') or cols_lower.get('volumes')
 
         if not col_cliente or not col_pedido:
-            st.error(f"❌ Colunas essenciais não encontradas no CSV. Colunas detectadas: {list(df.columns)}")
+            st.error(f"❌ Colunas essenciais não encontradas. Colunas no arquivo: {list(df.columns)}")
             return
 
-        # --- A. SINCRONIZAÇÃO DE CLIENTES ---
+        # --- A. BUSCA DE STATUS NO SUPABASE ---
+        res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
+        df_status_bd = pd.DataFrame(res_status.data) if res_status and res_status.data else pd.DataFrame()
+
+        if df_status_bd.empty:
+            st.error("❌ A tabela 'status_separacao' está vazia no Supabase. Cadastre os status no banco antes de continuar.")
+            return
+
+        # Mapeamento dinâmico por código/descrição para o ID REAL do banco
+        mapa_status_cod = {}
+        for _, row in df_status_bd.iterrows():
+            s_id = int(row['id'])
+            cod = str(row['codigo']).strip().lower() if pd.notna(row['codigo']) else ""
+            desc = str(row['descricao']).strip().lower() if pd.notna(row['descricao']) else ""
+
+            if cod: mapa_status_cod[cod] = s_id
+            if desc: mapa_status_cod[desc] = s_id
+
+        # Status padrão seguro (pega o primeiro ID válido existente no banco)
+        status_padrao_id = int(df_status_bd.iloc[0]['id'])
+
+        # --- B. SINCRONIZAÇÃO DE CLIENTES ---
         df['Cliente_Clean'] = df[col_cliente].astype(str).str.strip().str.slice(0, 255)
         clientes_unicos = [c for c in df['Cliente_Clean'].unique() if c and c.lower() not in ['nan', 'none', '']]
 
@@ -98,40 +119,13 @@ def processar_e_injetar_csv(file_upload):
             payload_clientes = [{'nome': c} for c in novos_clientes]
             supabase.table('clientes').insert(payload_clientes).execute()
 
-            # Recarrega a tabela de clientes
+            # Recarrega a tabela de clientes atualizada
             res_clientes = supabase.table('clientes').select('id, nome').execute()
             df_clientes_bd = pd.DataFrame(res_clientes.data) if res_clientes and res_clientes.data else pd.DataFrame()
             if not df_clientes_bd.empty:
                 df_clientes_bd['nome_clean'] = df_clientes_bd['nome'].astype(str).str.strip()
 
-        # Dicionário de consulta para Clientes
-        mapa_clientes = {}
-        if not df_clientes_bd.empty:
-            mapa_clientes = {str(row['nome_clean']).lower(): int(row['id']) for _, row in df_clientes_bd.iterrows()}
-
-        # --- B. MAPEAMENTO DE STATUS ---
-        res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
-        df_status_bd = pd.DataFrame(res_status.data) if res_status and res_status.data else pd.DataFrame()
-
-        mapa_status = {}
-        status_padrao_id = None
-
-        if not df_status_bd.empty:
-            status_padrao_id = int(df_status_bd.iloc[0]['id'])
-            for _, row in df_status_bd.iterrows():
-                s_id = int(row['id'])
-                cod = str(row['codigo']).strip().lower() if pd.notna(row['codigo']) else ""
-                desc = str(row['descricao']).strip().lower() if pd.notna(row['descricao']) else ""
-
-                if cod: mapa_status[cod] = s_id
-                if desc: mapa_status[desc] = s_id
-                if cod and desc:
-                    mapa_status[f"{cod}-{desc}"] = s_id
-                    mapa_status[f"{cod} - {desc}"] = s_id
-
-        # Se a tabela de status estiver vazia no Supabase, usa ID 1 como fallback
-        if status_padrao_id is None:
-            status_padrao_id = 1
+        mapa_clientes = {str(row['nome_clean']).lower(): int(row['id']) for _, row in df_clientes_bd.iterrows()} if not df_clientes_bd.empty else {}
 
         # --- C. CONSTRUÇÃO DO PAYLOAD ---
         payload_pedidos = []
@@ -143,25 +137,31 @@ def processar_e_injetar_csv(file_upload):
             if pd.isna(pedido_val) or str(pedido_val).strip() in ['', 'nan']:
                 continue
 
-            # Extração de números do pedido
             pedido_digits = ''.join(filter(str.isdigit, str(pedido_val)))
             if not pedido_digits:
                 continue
             pedido_num = int(pedido_digits)
 
-            # Busca ID do Cliente
             c_id = mapa_clientes.get(cliente_str.lower())
 
-            # Define Status (Mapeado ou Padrão)
-            s_id = status_padrao_id
+            # Inferência do status do pedido com base nas colunas preenchidas
+            if pd.notna(row.get('NF')) and str(row.get('NF')).strip() not in ['', 'nan']:
+                cod_inferido = '60'  # Ag. Faturamento Venda
+            elif pd.notna(row.get('FinalizaçãoConferência')) and str(row.get('FinalizaçãoConferência')).strip() not in ['', 'nan']:
+                cod_inferido = '60'
+            elif pd.notna(row.get('Dt.Inicio Separação')) and str(row.get('Dt.Inicio Separação')).strip() not in ['', 'nan']:
+                cod_inferido = '30'  # Em Separação
+            else:
+                cod_inferido = '10'  # Ag. Inicio Operação
 
-            if c_id is not None and s_id is not None:
-                # Tratamento flexível de data
+            # Mapeia para o ID real do banco ou usa o ID do primeiro status válido
+            s_id = mapa_status_cod.get(cod_inferido.lower(), status_padrao_id)
+
+            if c_id is not None:
                 raw_data = row.get(col_data) if col_data else None
                 data_parsed = pd.to_datetime(raw_data, errors='coerce')
                 data_iso = data_parsed.strftime('%Y-%m-%dT%H:%M:%S') if pd.notna(data_parsed) else None
 
-                # Tratamento de volume
                 raw_vol = row.get(col_vol) if col_vol else 0
                 vol_val = pd.to_numeric(raw_vol, errors='coerce')
                 vol_int = int(vol_val) if pd.notna(vol_val) else 0
@@ -185,7 +185,7 @@ def processar_e_injetar_csv(file_upload):
             st.cache_data.clear()
             st.rerun()
         else:
-            st.warning("⚠️ Nenhum pedido válido encontrado para injeção. Verifique a estrutura do arquivo.")
+            st.warning("⚠️ Nenhum pedido válido encontrado para injeção. Verifique os dados do CSV.")
 
     except Exception as e:
         st.error(f"❌ Erro durante o processamento do CSV: {str(e)}")
