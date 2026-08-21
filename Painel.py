@@ -50,8 +50,8 @@ supabase = iniciar_conexao_supabase()
 
 def processar_e_injetar_arquivo(file_upload):
     """
-    Lê CSV ou Excel, cadastra clientes/status e injeta os pedidos no Supabase 
-    utilizando 'upsert' com base na coluna 'numero_pedido' para evitar duplicidade.
+    Lê CSV ou Excel, cadastra clientes/status e injeta/atualiza os pedidos no Supabase 
+    evitando duplicidade via verificação prévia de 'numero_pedido'.
     """
     try:
         nome_arquivo = file_upload.name.lower()
@@ -71,8 +71,11 @@ def processar_e_injetar_arquivo(file_upload):
         cols_lower = {col.lower(): col for col in df.columns}
 
         col_cliente = cols_lower.get('cliente_nome') or cols_lower.get('cliente')
-        col_pedido = cols_lower.get('pv_limpo') or cols_lower.get('pv') or cols_lower.get('numero_pedido') or cols_lower.get('pedido') or cols_lower.get('(wms) ped. orig.') or cols_lower.get('nf')
-        col_data = cols_lower.get('emissão pv_data') or cols_lower.get('emissão pv') or cols_lower.get('abertoem') or cols_lower.get('emissao nf')
+        col_pedido = (cols_lower.get('pv_limpo') or cols_lower.get('pv') or 
+                      cols_lower.get('numero_pedido') or cols_lower.get('pedido') or 
+                      cols_lower.get('(wms) ped. orig.') or cols_lower.get('nf'))
+        col_data = (cols_lower.get('emissão pv_data') or cols_lower.get('emissão pv') or 
+                    cols_lower.get('abertoem') or cols_lower.get('emissao nf'))
         col_vol = cols_lower.get('volume') or cols_lower.get('volumes')
 
         if not col_cliente or not col_pedido:
@@ -130,8 +133,15 @@ def processar_e_injetar_arquivo(file_upload):
 
         mapa_clientes = {str(row['nome_clean']).lower(): int(row['id']) for _, row in df_clientes_bd.iterrows()}
 
-        # Construção de Payload
-        payload_pedidos = []
+        # Busca pedidos existentes no Supabase para evitar duplicidade
+        res_pedidos_existentes = supabase.table('pedidos').select('numero_pedido, id').execute()
+        mapa_pedidos_existentes = {}
+        if res_pedidos_existentes and res_pedidos_existentes.data:
+            mapa_pedidos_existentes = {p['numero_pedido']: p['id'] for p in res_pedidos_existentes.data if p.get('numero_pedido')}
+
+        novos_pedidos = []
+        pedidos_para_atualizar = []
+
         for _, row in df.iterrows():
             pedido_val = row.get(col_pedido)
             cliente_str = str(row.get('Cliente_Clean', '')).strip()
@@ -159,33 +169,48 @@ def processar_e_injetar_arquivo(file_upload):
 
             if c_id is not None:
                 raw_data = row.get(col_data) if col_data else None
-                data_parsed = pd.to_datetime(raw_data, errors='coerce')
+                data_parsed = pd.to_datetime(raw_data, dayfirst=True, errors='coerce')
                 data_iso = data_parsed.strftime('%Y-%m-%dT%H:%M:%S') if pd.notna(data_parsed) else None
 
                 raw_vol = row.get(col_vol) if col_vol else 0
                 vol_val = pd.to_numeric(raw_vol, errors='coerce')
                 vol_int = int(vol_val) if pd.notna(vol_val) else 0
 
-                payload_pedidos.append({
+                item_pedido = {
                     'numero_pedido': pedido_num,
                     'cliente_id': int(c_id),
                     'status_id': int(s_id),
                     'aberto_em': data_iso,
                     'volumes': vol_int
-                })
+                }
 
-        # Sincronização em Lote usando UPSERT
-        if payload_pedidos:
-            tamanho_lote = 100
-            for i in range(0, len(payload_pedidos), tamanho_lote):
-                lote = payload_pedidos[i:i + tamanho_lote]
-                supabase.table('pedidos').upsert(lote, on_conflict='numero_pedido').execute()
+                if pedido_num in mapa_pedidos_existentes:
+                    item_pedido['id'] = mapa_pedidos_existentes[pedido_num]
+                    pedidos_para_atualizar.append(item_pedido)
+                else:
+                    novos_pedidos.append(item_pedido)
 
-            st.success(f"✅ Sincronização concluída! {len(payload_pedidos)} registros processados sem duplicidade.")
-            st.cache_data.clear()
-            st.rerun()
-        else:
-            st.warning("⚠️ Nenhum pedido válido encontrado para processamento.")
+        # Inserção e Atualização em lotes de 100
+        tamanho_lote = 100
+        if novos_pedidos:
+            st.write(f"📦 Inserindo {len(novos_pedidos)} novos pedidos...")
+            for i in range(0, len(novos_pedidos), tamanho_lote):
+                lote = novos_pedidos[i:i + tamanho_lote]
+                supabase.table('pedidos').insert(lote).execute()
+
+        if pedidos_para_atualizar:
+            st.write(f"🔄 Atualizando {len(pedidos_para_atualizar)} pedidos existentes...")
+            for p in pedidos_para_atualizar:
+                supabase.table('pedidos').update({
+                    'cliente_id': p['cliente_id'],
+                    'status_id': p['status_id'],
+                    'aberto_em': p['aberto_em'],
+                    'volumes': p['volumes']
+                }).eq('id', p['id']).execute()
+
+        st.success(f"✅ Sucesso! Dados sincronizados sem duplicidades.")
+        st.cache_data.clear()
+        st.rerun()
 
     except Exception as e:
         st.error(f"❌ Erro no processamento do arquivo: {str(e)}")
