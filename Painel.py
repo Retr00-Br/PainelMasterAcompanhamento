@@ -50,8 +50,8 @@ supabase = iniciar_conexao_supabase()
 
 def processar_e_injetar_arquivo(file_upload):
     """
-    Lê CSV ou Excel, cadastra clientes/status e injeta/atualiza os pedidos no Supabase 
-    evitando duplicidade via verificação prévia de 'numero_pedido'.
+    Lê CSV ou Excel, cadastra clientes e status, remove duplicidades priorizando 
+    registros COM SALDO e sincroniza os pedidos via UPSERT no Supabase.
     """
     try:
         nome_arquivo = file_upload.name.lower()
@@ -65,24 +65,62 @@ def processar_e_injetar_arquivo(file_upload):
                 file_upload.seek(0)
                 df = pd.read_csv(file_upload, encoding='latin1', sep=None, engine='python')
 
+        # Limpeza de cabeçalhos
         df.columns = [str(col).replace('\ufeff', '').strip() for col in df.columns]
         st.info(f"⏳ Lendo {len(df)} registros do arquivo...")
 
         cols_lower = {col.lower(): col for col in df.columns}
 
         col_cliente = cols_lower.get('cliente_nome') or cols_lower.get('cliente')
-        col_pedido = (cols_lower.get('pv_limpo') or cols_lower.get('pv') or 
-                      cols_lower.get('numero_pedido') or cols_lower.get('pedido') or 
-                      cols_lower.get('(wms) ped. orig.') or cols_lower.get('nf'))
+        col_wms_ped = cols_lower.get('(wms) ped. orig.') or cols_lower.get('pv_limpo') or cols_lower.get('pv')
+        col_nf = cols_lower.get('nf') or cols_lower.get('numero_pedido') or cols_lower.get('pedido')
         col_data = (cols_lower.get('emissão pv_data') or cols_lower.get('emissão pv') or 
                     cols_lower.get('abertoem') or cols_lower.get('emissao nf'))
         col_vol = cols_lower.get('volume') or cols_lower.get('volumes')
+        col_saldo = cols_lower.get('possui saldo')
 
-        if not col_cliente or not col_pedido:
-            st.error(f"❌ Colunas essenciais não encontradas. Colunas disponíveis: {list(df.columns)}")
+        if not col_cliente or (not col_wms_ped and not col_nf):
+            st.error(f"❌ Colunas essenciais não encontradas. Colunas disponíveis no arquivo: {list(df.columns)}")
             return
 
-        # Sincronia de Status
+        # --- Extração e Limpeza do Número do Pedido ---
+        def extrair_numero_pedido(row):
+            val_wms = str(row.get(col_wms_ped, '')).strip() if col_wms_ped else ''
+            val_nf = str(row.get(col_nf, '')).strip() if col_nf else ''
+            
+            digits_wms = ''.join(filter(str.isdigit, val_wms))
+            if digits_wms:
+                return int(digits_wms)
+            
+            digits_nf = ''.join(filter(str.isdigit, val_nf))
+            if digits_nf:
+                return int(digits_nf)
+            
+            return None
+
+        df['ped_num_clean'] = df.apply(extrair_numero_pedido, axis=1)
+        df = df.dropna(subset=['ped_num_clean'])
+        df['ped_num_clean'] = df['ped_num_clean'].astype(int)
+
+        if df.empty:
+            st.warning("⚠️ Nenhum número de pedido válido foi identificado na planilha.")
+            return
+
+        # --- Lógica de Prioridade: Descartar "Sem Saldo" quando houver duplicidade ---
+        # Prioridade 0 = Com Saldo / Válido (Manter)
+        # Prioridade 1 = Sem Saldo (Descartar se houver registro com saldo)
+        if col_saldo:
+            df['peso_saldo'] = df[col_saldo].astype(str).str.strip().str.lower().apply(
+                lambda x: 1 if any(termo in x for termo in ['não', 'nao', 'f', 'false', '0', 'sem saldo']) else 0
+            )
+        else:
+            df['peso_saldo'] = 0
+
+        # Ordena priorizando quem tem saldo (peso 0 no topo) e desduplica a planilha
+        df = df.sort_values(by='peso_saldo', ascending=True)
+        df = df.drop_duplicates(subset=['ped_num_clean'], keep='first')
+
+        # --- Sincronia da Tabela status_separacao ---
         res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
         df_status_bd = pd.DataFrame(res_status.data) if res_status and res_status.data else pd.DataFrame()
 
@@ -108,7 +146,7 @@ def processar_e_injetar_arquivo(file_upload):
 
         status_padrao_id = int(df_status_bd.iloc[0]['id'])
 
-        # Sincronia de Clientes
+        # --- Sincronia da Tabela clientes ---
         df['Cliente_Clean'] = df[col_cliente].astype(str).str.strip().str.slice(0, 255)
         clientes_unicos = [c for c in df['Cliente_Clean'].unique() if c and c.lower() not in ['nan', 'none', '']]
 
@@ -123,7 +161,7 @@ def processar_e_injetar_arquivo(file_upload):
             novos_clientes = clientes_unicos
 
         if novos_clientes:
-            st.write(f"➕ Cadastrando {len(novos_clientes)} novos clientes...")
+            st.write(f"➕ Cadastrating {len(novos_clientes)} novos clientes...")
             payload_clientes = [{'nome': c} for c in novos_clientes]
             supabase.table('clientes').insert(payload_clientes).execute()
 
@@ -133,30 +171,24 @@ def processar_e_injetar_arquivo(file_upload):
 
         mapa_clientes = {str(row['nome_clean']).lower(): int(row['id']) for _, row in df_clientes_bd.iterrows()}
 
-        # Busca pedidos existentes no Supabase para evitar duplicidade
-        res_pedidos_existentes = supabase.table('pedidos').select('numero_pedido, id').execute()
-        mapa_pedidos_existentes = {}
-        if res_pedidos_existentes and res_pedidos_existentes.data:
-            mapa_pedidos_existentes = {p['numero_pedido']: p['id'] for p in res_pedidos_existentes.data if p.get('numero_pedido')}
+        # --- Consulta Pedidos Existentes no Supabase ---
+        res_pedidos_existentes = supabase.table('pedidos').select('id, numero_pedido, status_id').execute()
+        pedidos_bd_mapa = {p['numero_pedido']: p for p in res_pedidos_existentes.data} if res_pedidos_existentes and res_pedidos_existentes.data else {}
 
-        novos_pedidos = []
-        pedidos_para_atualizar = []
+        payload_upsert = []
 
         for _, row in df.iterrows():
-            pedido_val = row.get(col_pedido)
+            pedido_num = int(row['ped_num_clean'])
             cliente_str = str(row.get('Cliente_Clean', '')).strip()
-
-            if pd.isna(pedido_val) or str(pedido_val).strip() in ['', 'nan']:
-                continue
-
-            pedido_digits = ''.join(filter(str.isdigit, str(pedido_val)))
-            if not pedido_digits:
-                continue
-            pedido_num = int(pedido_digits)
-
             c_id = mapa_clientes.get(cliente_str.lower())
 
-            if pd.notna(row.get('NF')) and str(row.get('NF')).strip() not in ['', 'nan']:
+            if c_id is None:
+                continue
+
+            # Inferência de Status
+            if row.get('peso_saldo') == 1:
+                cod_inferido = '00'  # Sem Saldo
+            elif pd.notna(row.get('NF')) and str(row.get('NF')).strip() not in ['', 'nan']:
                 cod_inferido = '65' if pd.notna(row.get('Transport.')) else '60'
             elif pd.notna(row.get('FinalizacaoConferencia')) and str(row.get('FinalizacaoConferencia')).strip() not in ['', 'nan']:
                 cod_inferido = '60'
@@ -167,50 +199,47 @@ def processar_e_injetar_arquivo(file_upload):
 
             s_id = mapa_status_cod.get(cod_inferido.lower(), status_padrao_id)
 
-            if c_id is not None:
-                raw_data = row.get(col_data) if col_data else None
-                data_parsed = pd.to_datetime(raw_data, dayfirst=True, errors='coerce')
-                data_iso = data_parsed.strftime('%Y-%m-%dT%H:%M:%S') if pd.notna(data_parsed) else None
+            # Trava: se o pedido já existe no banco com saldo (status_id != 1) e a planilha traz "Sem Saldo", ignora
+            if pedido_num in pedidos_bd_mapa:
+                ped_existente = pedidos_bd_mapa[pedido_num]
+                if ped_existente.get('status_id') != 1 and s_id == 1:
+                    continue
 
-                raw_vol = row.get(col_vol) if col_vol else 0
-                vol_val = pd.to_numeric(raw_vol, errors='coerce')
-                vol_int = int(vol_val) if pd.notna(vol_val) else 0
+            raw_data = row.get(col_data) if col_data else None
+            data_parsed = pd.to_datetime(raw_data, dayfirst=True, errors='coerce')
+            data_iso = data_parsed.strftime('%Y-%m-%dT%H:%M:%S') if pd.notna(data_parsed) else None
 
-                item_pedido = {
-                    'numero_pedido': pedido_num,
-                    'cliente_id': int(c_id),
-                    'status_id': int(s_id),
-                    'aberto_em': data_iso,
-                    'volumes': vol_int
-                }
+            raw_vol = row.get(col_vol) if col_vol else 0
+            vol_val = pd.to_numeric(raw_vol, errors='coerce')
+            vol_int = int(vol_val) if pd.notna(vol_val) else 0
 
-                if pedido_num in mapa_pedidos_existentes:
-                    item_pedido['id'] = mapa_pedidos_existentes[pedido_num]
-                    pedidos_para_atualizar.append(item_pedido)
-                else:
-                    novos_pedidos.append(item_pedido)
+            item_pedido = {
+                'numero_pedido': pedido_num,
+                'cliente_id': int(c_id),
+                'status_id': int(s_id),
+                'aberto_em': data_iso,
+                'volumes': vol_int
+            }
 
-        # Inserção e Atualização em lotes de 100
-        tamanho_lote = 100
-        if novos_pedidos:
-            st.write(f"📦 Inserindo {len(novos_pedidos)} novos pedidos...")
-            for i in range(0, len(novos_pedidos), tamanho_lote):
-                lote = novos_pedidos[i:i + tamanho_lote]
-                supabase.table('pedidos').insert(lote).execute()
+            # Se já existir, vincula a PK id para forçar update limpo
+            if pedido_num in pedidos_bd_mapa:
+                item_pedido['id'] = pedidos_bd_mapa[pedido_num]['id']
 
-        if pedidos_para_atualizar:
-            st.write(f"🔄 Atualizando {len(pedidos_para_atualizar)} pedidos existentes...")
-            for p in pedidos_para_atualizar:
-                supabase.table('pedidos').update({
-                    'cliente_id': p['cliente_id'],
-                    'status_id': p['status_id'],
-                    'aberto_em': p['aberto_em'],
-                    'volumes': p['volumes']
-                }).eq('id', p['id']).execute()
+            payload_upsert.append(item_pedido)
 
-        st.success(f"✅ Sucesso! Dados sincronizados sem duplicidades.")
-        st.cache_data.clear()
-        st.rerun()
+        # Inserção / Atualização em lotes de 100 via UPSERT
+        if payload_upsert:
+            st.write(f"⚙️ Sincronizando {len(payload_upsert)} pedidos desduplicados com o Supabase...")
+            tamanho_lote = 100
+            for i in range(0, len(payload_upsert), tamanho_lote):
+                lote = payload_upsert[i:i + tamanho_lote]
+                supabase.table('pedidos').upsert(lote, on_conflict='numero_pedido').execute()
+
+            st.success("✅ Processamento e sincronização concluídos com sucesso!")
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            st.info("ℹ️ Nenhum pedido novo ou atualizado para processar.")
 
     except Exception as e:
         st.error(f"❌ Erro no processamento do arquivo: {str(e)}")
@@ -318,11 +347,21 @@ def renderizar_controle_logistico(file_upload):
             if file_upload.name.endswith('.xlsx') or file_upload.name.endswith('.xls'):
                 df_log = pd.read_excel(file_upload)
             else:
-                df_log = pd.read_csv(file_upload)
+                try:
+                    df_log = pd.read_csv(file_upload, encoding='utf-8-sig', sep=None, engine='python')
+                except Exception:
+                    file_upload.seek(0)
+                    df_log = pd.read_csv(file_upload, encoding='latin1', sep=None, engine='python')
 
-            # Métricas rápidas da Logística
+            # Trata valor monetário
+            if 'ValorNF.1' in df_log.columns:
+                df_log['ValorNF_Clean'] = df_log['ValorNF.1'].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+                df_log['ValorNF_Clean'] = pd.to_numeric(df_log['ValorNF_Clean'], errors='coerce').fillna(0)
+            else:
+                df_log['ValorNF_Clean'] = 0
+
             m1, m2, m3, m4 = st.columns(4)
-            val_total = df_log['ValorNF.1'].sum() if 'ValorNF.1' in df_log.columns else 0
+            val_total = df_log['ValorNF_Clean'].sum()
             transp_count = df_log['Transport.'].nunique() if 'Transport.' in df_log.columns else 0
             entregues = df_log['Dt. Entrega Real'].notna().sum() if 'Dt. Entrega Real' in df_log.columns else 0
             dev = df_log['NF. Devolucao'].notna().sum() if 'NF. Devolucao' in df_log.columns else 0
@@ -338,15 +377,15 @@ def renderizar_controle_logistico(file_upload):
 
             with col_a:
                 st.markdown("**Volume Faturado por Transportadora**")
-                if 'Transport.' in df_log.columns and 'ValorNF.1' in df_log.columns:
-                    df_transp = df_log.groupby('Transport.')['ValorNF.1'].sum().reset_index()
-                    fig_tr = px.pie(df_transp, values='ValorNF.1', names='Transport.', hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+                if 'Transport.' in df_log.columns:
+                    df_transp = df_log.groupby('Transport.')['ValorNF_Clean'].sum().reset_index()
+                    fig_tr = px.pie(df_transp, values='ValorNF_Clean', names='Transport.', hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
                     st.plotly_chart(fig_tr, use_container_width=True)
 
             with col_b:
                 st.markdown("**Status de Entregas Realizadas**")
                 if 'Dt. Entrega Real' in df_log.columns:
-                    df_log['Status_Entrega'] = df_log['Dt. Entrega Real'].apply(lambda x: 'Entregue' if pd.notna(x) else 'Em Trânsito / Pendente')
+                    df_log['Status_Entrega'] = df_log['Dt. Entrega Real'].apply(lambda x: 'Entregue' if pd.notna(x) and str(x).strip() != '' else 'Em Trânsito / Pendente')
                     fig_ent = px.histogram(df_log, x='Status_Entrega', color='Status_Entrega', color_discrete_sequence=['#2ecc71', '#e74c3c'])
                     st.plotly_chart(fig_ent, use_container_width=True)
 
@@ -427,7 +466,6 @@ def main():
 
     with aba_logistica:
         renderizar_controle_logistico(arquivo_upload)
-
 
 if __name__ == "__main__":
     main()
