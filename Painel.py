@@ -7,7 +7,7 @@ import os
 # 1. CONFIGURAÇÃO DA PÁGINA E BRANDING
 
 NOME_APLICACAO = "Painel Master Higimed"
-CAMINHO_LOGO = "logo.webp"  # Certifique-se de que o arquivo 'logo.webp' está na raiz do seu projeto no Git
+CAMINHO_LOGO = "logo.webp"
 
 st.set_page_config(
     page_title=NOME_APLICACAO,
@@ -29,9 +29,8 @@ st.markdown("""
 
 @st.cache_resource
 def iniciar_conexao_supabase() -> Client:
-    """Inicializa e mantém em cache a conexão com o Supabase de forma segura."""
+    """Inicializa e mantém em cache a conexão com o Supabase."""
     try:
-        # Busca no st.secrets ou em variáveis de ambiente
         if "supabase" in st.secrets:
             url = st.secrets["supabase"]["SUPABASE_URL"]
             key = st.secrets["supabase"]["SUPABASE_KEY"]
@@ -39,7 +38,6 @@ def iniciar_conexao_supabase() -> Client:
             url = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL", ""))
             key = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
 
-        # Trata barras residuais no final da URL para evitar erro PGRST125
         url_limpa = url.rstrip("/")
         return create_client(url_limpa, key)
     except Exception as e:
@@ -48,45 +46,44 @@ def iniciar_conexao_supabase() -> Client:
 
 supabase = iniciar_conexao_supabase()
 
-# 3. INJEÇÃO DE DADOS (UPLOAD CSV)
+# 3. INJEÇÃO DE DADOS (UPLOAD CSV/EXCEL SEM DUPLICIDADE)
 
-def processar_e_injetar_csv(file_upload):
+def processar_e_injetar_arquivo(file_upload):
     """
-    Lê o CSV, cadastra/recupera status_separacao automaticamente,
-    sincroniza Clientes e injeta os Pedidos no Supabase.
+    Lê CSV ou Excel, cadastra clientes/status e injeta os pedidos no Supabase 
+    utilizando 'upsert' com base na coluna 'numero_pedido' para evitar duplicidade.
     """
     try:
-        # 1. Leitura do arquivo tratando o caractere invisível BOM (\ufeff)
-        try:
-            file_upload.seek(0)
-            df = pd.read_csv(file_upload, encoding='utf-8-sig', sep=None, engine='python')
-        except Exception:
-            file_upload.seek(0)
-            df = pd.read_csv(file_upload, encoding='latin1', sep=None, engine='python')
+        nome_arquivo = file_upload.name.lower()
+        if nome_arquivo.endswith('.xlsx') or nome_arquivo.endswith('.xls'):
+            df = pd.read_excel(file_upload)
+        else:
+            try:
+                file_upload.seek(0)
+                df = pd.read_csv(file_upload, encoding='utf-8-sig', sep=None, engine='python')
+            except Exception:
+                file_upload.seek(0)
+                df = pd.read_csv(file_upload, encoding='latin1', sep=None, engine='python')
 
-        # Normalização de cabeçalhos
         df.columns = [str(col).replace('\ufeff', '').strip() for col in df.columns]
-        st.info(f"⏳ Lendo {len(df)} registros do arquivo CSV...")
+        st.info(f"⏳ Lendo {len(df)} registros do arquivo...")
 
         cols_lower = {col.lower(): col for col in df.columns}
 
-        # Identificação de colunas do CSV
         col_cliente = cols_lower.get('cliente_nome') or cols_lower.get('cliente')
-        col_pedido = cols_lower.get('pv_limpo') or cols_lower.get('pv') or cols_lower.get('numero_pedido') or cols_lower.get('pedido')
-        col_data = cols_lower.get('emissão pv_data') or cols_lower.get('emissão pv') or cols_lower.get('abertoem')
+        col_pedido = cols_lower.get('pv_limpo') or cols_lower.get('pv') or cols_lower.get('numero_pedido') or cols_lower.get('pedido') or cols_lower.get('(wms) ped. orig.') or cols_lower.get('nf')
+        col_data = cols_lower.get('emissão pv_data') or cols_lower.get('emissão pv') or cols_lower.get('abertoem') or cols_lower.get('emissao nf')
         col_vol = cols_lower.get('volume') or cols_lower.get('volumes')
 
         if not col_cliente or not col_pedido:
-            st.error(f"❌ Colunas essenciais não encontradas no CSV. Colunas disponíveis: {list(df.columns)}")
+            st.error(f"❌ Colunas essenciais não encontradas. Colunas disponíveis: {list(df.columns)}")
             return
 
-        # --- A. VERIFICAÇÃO E POPULAÇÃO AUTOMÁTICA DE STATUS_SEPARACAO ---
+        # Sincronia de Status
         res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
         df_status_bd = pd.DataFrame(res_status.data) if res_status and res_status.data else pd.DataFrame()
 
-        # Se a tabela estiver vazia, insere os registros padrões informando os IDs
         if df_status_bd.empty:
-            st.info("ℹ️ A tabela 'status_separacao' está vazia. Inserindo status padrões no Supabase...")
             status_padrao = [
                 {'id': 1, 'codigo': '00', 'descricao': 'Sem Saldo'},
                 {'id': 2, 'codigo': '10', 'descricao': 'Ag. Inicio Operacao'},
@@ -95,24 +92,20 @@ def processar_e_injetar_csv(file_upload):
                 {'id': 5, 'codigo': '65', 'descricao': 'Ag. Transportadora'}
             ]
             supabase.table('status_separacao').insert(status_padrao).execute()
-
-            # Recarrega a tabela de status atualizada
             res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
-            df_status_bd = pd.DataFrame(res_status.data) if res_status and res_status.data else pd.DataFrame()
+            df_status_bd = pd.DataFrame(res_status.data)
 
-        # Mapeamento de código/descrição -> ID real do Supabase
         mapa_status_cod = {}
         for _, row in df_status_bd.iterrows():
             s_id = int(row['id'])
             cod = str(row['codigo']).strip().lower() if pd.notna(row['codigo']) else ""
             desc = str(row['descricao']).strip().lower() if pd.notna(row['descricao']) else ""
-
             if cod: mapa_status_cod[cod] = s_id
             if desc: mapa_status_cod[desc] = s_id
 
         status_padrao_id = int(df_status_bd.iloc[0]['id'])
 
-        # --- B. SINCRONIZAÇÃO DE CLIENTES ---
+        # Sincronia de Clientes
         df['Cliente_Clean'] = df[col_cliente].astype(str).str.strip().str.slice(0, 255)
         clientes_unicos = [c for c in df['Cliente_Clean'].unique() if c and c.lower() not in ['nan', 'none', '']]
 
@@ -127,20 +120,18 @@ def processar_e_injetar_csv(file_upload):
             novos_clientes = clientes_unicos
 
         if novos_clientes:
-            st.write(f"➕ Cadastrando {len(novos_clientes)} novos clientes no Supabase...")
+            st.write(f"➕ Cadastrando {len(novos_clientes)} novos clientes...")
             payload_clientes = [{'nome': c} for c in novos_clientes]
             supabase.table('clientes').insert(payload_clientes).execute()
 
             res_clientes = supabase.table('clientes').select('id, nome').execute()
-            df_clientes_bd = pd.DataFrame(res_clientes.data) if res_clientes and res_clientes.data else pd.DataFrame()
-            if not df_clientes_bd.empty:
-                df_clientes_bd['nome_clean'] = df_clientes_bd['nome'].astype(str).str.strip()
+            df_clientes_bd = pd.DataFrame(res_clientes.data)
+            df_clientes_bd['nome_clean'] = df_clientes_bd['nome'].astype(str).str.strip()
 
-        mapa_clientes = {str(row['nome_clean']).lower(): int(row['id']) for _, row in df_clientes_bd.iterrows()} if not df_clientes_bd.empty else {}
+        mapa_clientes = {str(row['nome_clean']).lower(): int(row['id']) for _, row in df_clientes_bd.iterrows()}
 
-        # --- C. CONSTRUÇÃO DO PAYLOAD DE PEDIDOS ---
+        # Construção de Payload
         payload_pedidos = []
-
         for _, row in df.iterrows():
             pedido_val = row.get(col_pedido)
             cliente_str = str(row.get('Cliente_Clean', '')).strip()
@@ -155,12 +146,11 @@ def processar_e_injetar_csv(file_upload):
 
             c_id = mapa_clientes.get(cliente_str.lower())
 
-            # Inferência do código de status baseado nas colunas do CSV
             if pd.notna(row.get('NF')) and str(row.get('NF')).strip() not in ['', 'nan']:
+                cod_inferido = '65' if pd.notna(row.get('Transport.')) else '60'
+            elif pd.notna(row.get('FinalizacaoConferencia')) and str(row.get('FinalizacaoConferencia')).strip() not in ['', 'nan']:
                 cod_inferido = '60'
-            elif pd.notna(row.get('FinalizaçãoConferência')) and str(row.get('FinalizaçãoConferência')).strip() not in ['', 'nan']:
-                cod_inferido = '60'
-            elif pd.notna(row.get('Dt.Inicio Separação')) and str(row.get('Dt.Inicio Separação')).strip() not in ['', 'nan']:
+            elif pd.notna(row.get('Dt.Inicio Separacao')) and str(row.get('Dt.Inicio Separacao')).strip() not in ['', 'nan']:
                 cod_inferido = '30'
             else:
                 cod_inferido = '10'
@@ -184,29 +174,27 @@ def processar_e_injetar_csv(file_upload):
                     'volumes': vol_int
                 })
 
-        # --- D. INJEÇÃO DOS DADOS ---
+        # Sincronização em Lote usando UPSERT
         if payload_pedidos:
             tamanho_lote = 100
             for i in range(0, len(payload_pedidos), tamanho_lote):
                 lote = payload_pedidos[i:i + tamanho_lote]
-                supabase.table('pedidos').insert(lote).execute()
+                supabase.table('pedidos').upsert(lote, on_conflict='numero_pedido').execute()
 
-            st.success(f"✅ Sucesso! {len(payload_pedidos)} pedidos injetados no Supabase.")
+            st.success(f"✅ Sincronização concluída! {len(payload_pedidos)} registros processados sem duplicidade.")
             st.cache_data.clear()
             st.rerun()
         else:
-            st.warning("⚠️ Nenhum pedido válido encontrado para injeção. Verifique a estrutura do arquivo.")
+            st.warning("⚠️ Nenhum pedido válido encontrado para processamento.")
 
     except Exception as e:
-        st.error(f"❌ Erro durante o processamento do CSV: {str(e)}")
-        
+        st.error(f"❌ Erro no processamento do arquivo: {str(e)}")
+
 # 4. CARREGAMENTO DOS DADOS PARA O DASHBOARD
 
 @st.cache_data(ttl=60)
 def carregar_dados_painel() -> pd.DataFrame:
-    """Busca os dados relacionados via Supabase API utilizando JOIN normalizado."""
     try:
-        # Query simplificada para evitar falhas de interpretação na rota API
         res = supabase.table('pedidos').select(
             'id, numero_pedido, aberto_em, volumes, clientes(nome), status_separacao(codigo, descricao)'
         ).execute()
@@ -236,13 +224,11 @@ def carregar_dados_painel() -> pd.DataFrame:
     except Exception as e:
         st.error(f"Erro ao conectar ao Supabase: {str(e)}")
         return pd.DataFrame()
-        
-# 5. COMPONENTES VISUAIS
+
+# 5. COMPONENTES VISUAIS - BI DE OPERAÇÕES DE SEPARAÇÃO
 
 def renderizar_blocos_status(df: pd.DataFrame, status_list: list):
-    """Renderiza os botões clicáveis para filtrar o painel."""
     st.subheader("Painel de Acompanhamento de Separações")
-    
     if 'status_selecionado' not in st.session_state:
         st.session_state.status_selecionado = "Todos"
 
@@ -264,7 +250,6 @@ def renderizar_blocos_status(df: pd.DataFrame, status_list: list):
                 st.rerun()
 
 def renderizar_graficos(df: pd.DataFrame, status_ativo: str):
-    """Exibe os gráficos de pedidos e volumetria por cliente."""
     col1, col2 = st.columns(2)
 
     with col1:
@@ -274,21 +259,11 @@ def renderizar_graficos(df: pd.DataFrame, status_ativo: str):
             top_clientes.columns = ['Cliente', 'Qtd_Pedidos']
 
             fig = px.bar(
-                top_clientes,
-                x='Qtd_Pedidos',
-                y='Cliente',
-                orientation='h',
-                color='Qtd_Pedidos',
-                color_continuous_scale='Blues_r',
-                text='Qtd_Pedidos'
+                top_clientes, x='Qtd_Pedidos', y='Cliente', orientation='h',
+                color='Qtd_Pedidos', color_continuous_scale='Blues_r', text='Qtd_Pedidos'
             )
             fig.update_traces(textposition='outside')
-            fig.update_layout(
-                yaxis={'categoryorder': 'total ascending'},
-                xaxis_title=None, yaxis_title=None,
-                coloraxis_showscale=False, height=380,
-                margin=dict(l=0, r=0, t=20, b=0)
-            )
+            fig.update_layout(yaxis={'categoryorder': 'total ascending'}, xaxis_title=None, yaxis_title=None, coloraxis_showscale=False, height=380, margin=dict(l=0, r=0, t=20, b=0))
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Nenhum pedido encontrado para o filtro selecionado.")
@@ -298,29 +273,70 @@ def renderizar_graficos(df: pd.DataFrame, status_ativo: str):
         if not df.empty and df['Volumes'].sum() > 0:
             top_volumes = df.groupby('Cliente')['Volumes'].sum().reset_index().sort_values(by='Volumes', ascending=False).head(10)
             fig_vol = px.bar(
-                top_volumes,
-                x='Volumes',
-                y='Cliente',
-                orientation='h',
-                color='Volumes',
-                color_continuous_scale='Teal',
-                text='Volumes'
+                top_volumes, x='Volumes', y='Cliente', orientation='h',
+                color='Volumes', color_continuous_scale='Teal', text='Volumes'
             )
             fig_vol.update_traces(textposition='outside')
-            fig_vol.update_layout(
-                yaxis={'categoryorder': 'total ascending'},
-                xaxis_title=None, yaxis_title=None,
-                coloraxis_showscale=False, height=380,
-                margin=dict(l=0, r=0, t=20, b=0)
-            )
+            fig_vol.update_layout(yaxis={'categoryorder': 'total ascending'}, xaxis_title=None, yaxis_title=None, coloraxis_showscale=False, height=380, margin=dict(l=0, r=0, t=20, b=0))
             st.plotly_chart(fig_vol, use_container_width=True)
         else:
             st.info("Sem registro de volumes para os pedidos deste status.")
 
-# 6. PONTO DE ENTRADA (MAIN)
+# 6. COMPONENTES VISUAIS - CONTROLE LOGÍSTICO (NOVA ABA)
+
+def renderizar_controle_logistico(file_upload):
+    st.subheader("🚛 Gestão e Controle Logístico de Entregas")
+
+    if file_upload is not None:
+        try:
+            file_upload.seek(0)
+            if file_upload.name.endswith('.xlsx') or file_upload.name.endswith('.xls'):
+                df_log = pd.read_excel(file_upload)
+            else:
+                df_log = pd.read_csv(file_upload)
+
+            # Métricas rápidas da Logística
+            m1, m2, m3, m4 = st.columns(4)
+            val_total = df_log['ValorNF.1'].sum() if 'ValorNF.1' in df_log.columns else 0
+            transp_count = df_log['Transport.'].nunique() if 'Transport.' in df_log.columns else 0
+            entregues = df_log['Dt. Entrega Real'].notna().sum() if 'Dt. Entrega Real' in df_log.columns else 0
+            dev = df_log['NF. Devolucao'].notna().sum() if 'NF. Devolucao' in df_log.columns else 0
+
+            m1.metric("Faturamento Processado", f"R$ {val_total:,.2f}")
+            m2.metric("Transportadoras Ativas", transp_count)
+            m3.metric("Entregas Concluídas", entregues)
+            m4.metric("Devoluções Registradas", dev)
+
+            st.markdown("---")
+
+            col_a, col_b = st.columns(2)
+
+            with col_a:
+                st.markdown("**Volume Faturado por Transportadora**")
+                if 'Transport.' in df_log.columns and 'ValorNF.1' in df_log.columns:
+                    df_transp = df_log.groupby('Transport.')['ValorNF.1'].sum().reset_index()
+                    fig_tr = px.pie(df_transp, values='ValorNF.1', names='Transport.', hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+                    st.plotly_chart(fig_tr, use_container_width=True)
+
+            with col_b:
+                st.markdown("**Status de Entregas Realizadas**")
+                if 'Dt. Entrega Real' in df_log.columns:
+                    df_log['Status_Entrega'] = df_log['Dt. Entrega Real'].apply(lambda x: 'Entregue' if pd.notna(x) else 'Em Trânsito / Pendente')
+                    fig_ent = px.histogram(df_log, x='Status_Entrega', color='Status_Entrega', color_discrete_sequence=['#2ecc71', '#e74c3c'])
+                    st.plotly_chart(fig_ent, use_container_width=True)
+
+            st.markdown("**Detalhamento de Romaneios e Expedição Logística**")
+            cols_exibicao = [c for c in ['NF', 'Cliente', 'Transport.', 'Dt. Romaneio', 'Dt. Entrega Real', 'ValorNF.1', 'Comentario'] if c in df_log.columns]
+            st.dataframe(df_log[cols_exibicao], use_container_width=True, hide_index=True)
+
+        except Exception as e:
+            st.error(f"Erro ao carregar os dados logísticos do arquivo: {str(e)}")
+    else:
+        st.info("💡 Faça o upload da planilha de Base de Dados (`.xlsx` ou `.csv`) na barra lateral para carregar a análise logística completa.")
+
+# 7. PONTO DE ENTRADA (MAIN)
 
 def main():
-    # --- BARRA LATERAL (SIDEBAR) ---
     if os.path.exists(CAMINHO_LOGO):
         st.sidebar.image(CAMINHO_LOGO, use_container_width=True)
     else:
@@ -328,18 +344,16 @@ def main():
 
     st.sidebar.markdown("---")
 
-    # Módulo de Injeção de Dados (Upload)
-    st.sidebar.header("📥 Injeção de Dados (CSV)")
-    arquivo_csv = st.sidebar.file_uploader("Selecione o arquivo CSV:", type=["csv"])
+    st.sidebar.header("📥 Injeção de Dados (CSV / Excel)")
+    arquivo_upload = st.sidebar.file_uploader("Selecione o arquivo:", type=["csv", "xlsx", "xls"])
 
-    if arquivo_csv is not None:
-        if st.sidebar.button("🚀 Injetar no Supabase", use_container_width=True):
-            processar_e_injetar_csv(arquivo_csv)
+    if arquivo_upload is not None:
+        if st.sidebar.button("🚀 Sincronizar com Supabase", use_container_width=True):
+            processar_e_injetar_arquivo(arquivo_upload)
 
     st.sidebar.markdown("---")
     st.sidebar.caption("Master Higimed © 2026 - Gestão de Operações")
 
-    # --- PÁGINA PRINCIPAL COM LOGO ---
     col_logo, col_titulo = st.columns([1, 4])
     with col_logo:
         if os.path.exists(CAMINHO_LOGO):
@@ -350,43 +364,44 @@ def main():
 
     st.markdown("---")
 
-    # Carrega os dados atualizados do banco
-    df_pedidos = carregar_dados_painel()
+    # Estrutura de Abas para Separar o BI das Operações e a Gestão Logística
+    aba_bi, aba_logistica = st.tabs(["📊 BI Operações & Separação", "🚚 Controle Logístico & Entregas"])
 
-    # Mapeia lista de status para a esteira
-    lista_status = [
-        "00-Sem Saldo",
-        "10-Ag.Inicio Operação",
-        "30-Em Separação",
-        "60-Ag.Faturamento Venda",
-        "65-Ag.Transportadora"
-    ]
+    with aba_bi:
+        df_pedidos = carregar_dados_painel()
 
-    # Renderiza os blocos superiores interativos
-    renderizar_blocos_status(df_pedidos, lista_status)
-    st.markdown("---")
+        lista_status = [
+            "00-Sem Saldo",
+            "10-Ag.Inicio Operação",
+            "30-Em Separação",
+            "60-Ag.Faturamento Venda",
+            "65-Ag.Transportadora"
+        ]
 
-    # Aplica o filtro selecionado pelo usuário nos botões
-    status_ativo = st.session_state.get('status_selecionado', 'Todos')
-    if status_ativo != "Todos" and not df_pedidos.empty:
-        df_filtrado = df_pedidos[df_pedidos['Status'] == status_ativo]
-    else:
-        df_filtrado = df_pedidos.copy()
+        renderizar_blocos_status(df_pedidos, lista_status)
+        st.markdown("---")
 
-    # Exibe gráficos dinâmicos
-    renderizar_graficos(df_filtrado, status_ativo)
-    st.markdown("---")
+        status_ativo = st.session_state.get('status_selecionado', 'Todos')
+        if status_ativo != "Todos" and not df_pedidos.empty:
+            df_filtrado = df_pedidos[df_pedidos['Status'] == status_ativo]
+        else:
+            df_filtrado = df_pedidos.copy()
 
-    # Tabela analítica detalhada
-    st.subheader(f"📋 Relação Detalhada dos Pedidos - [{status_ativo}]")
-    if not df_filtrado.empty:
-        st.dataframe(
-            df_filtrado[['Pedido', 'Cliente', 'AbertoEm', 'Volumes', 'Status']],
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info("Nenhum pedido cadastrado no momento.")
+        renderizar_graficos(df_filtrado, status_ativo)
+        st.markdown("---")
+
+        st.subheader(f"📋 Relação Detalhada dos Pedidos - [{status_ativo}]")
+        if not df_filtrado.empty:
+            st.dataframe(
+                df_filtrado[['Pedido', 'Cliente', 'AbertoEm', 'Volumes', 'Status']],
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("Nenhum pedido cadastrado no momento.")
+
+    with aba_logistica:
+        renderizar_controle_logistico(arquivo_upload)
 
 
 if __name__ == "__main__":
