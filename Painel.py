@@ -8,6 +8,7 @@ from datetime import datetime
 
 # 1. CONFIGURAÇÃO DA PÁGINA E BRANDING
 NOME_APLICACAO = "Painel Master Higimed"
+EMPRESA_NOME = "Higimed Industrial"
 CAMINHO_LOGO = "logo.webp"
 
 st.set_page_config(
@@ -22,6 +23,14 @@ st.markdown("""
     .stAppHeader { background-color: #f8f9fa; }
     .stMetric { background-color: #ffffff; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); border-left: 5px solid #0056b3; }
     div[data-testid="stMetricValue"] > div { font-size: 26px; color: #0056b3; font-weight: bold; }
+    .footer-style {
+        text-align: center;
+        color: #6c757d;
+        font-size: 14px;
+        padding: 20px 0 10px 0;
+        border-top: 1px solid #e9ecef;
+        margin-top: 30px;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -82,6 +91,10 @@ def executar_etl_bi(file_separacao, file_logistica=None) -> pd.DataFrame:
             df_bi['Cliente_Final'] = 'Cliente Não Identificado'
 
         df_bi['Status_Unificado'] = df_bi['Status'].fillna('10-Ag.Inicio Operação').astype(str).str.strip()
+        
+        # DEDUPLICAÇÃO PARA EVITAR O ERRO ON CONFLICT DO UPDATE
+        df_bi = df_bi.drop_duplicates(subset=['PEDIDO_KEY'], keep='first')
+
         return df_bi
 
     except Exception as e:
@@ -95,6 +108,7 @@ def sincronizar_com_supabase(df_bi: pd.DataFrame):
             st.warning("Nenhum dado para sincronizar.")
             return
 
+        # 1. Clientes
         clientes_unicos = [str(c).strip() for c in df_bi['Cliente_Final'].dropna().unique() if str(c).strip() != '']
         res_clientes = supabase.table('clientes').select('id, nome').execute()
         df_cli_bd = pd.DataFrame(res_clientes.data) if res_clientes and res_clientes.data else pd.DataFrame(columns=['id', 'nome'])
@@ -106,12 +120,15 @@ def sincronizar_com_supabase(df_bi: pd.DataFrame):
             novos = [{'nome': c} for c in clientes_unicos]
 
         if novos:
-            supabase.table('clientes').insert(novos).execute()
+            # Deduplicação no envio dos novos clientes
+            novos_dedup = list({c['nome'].lower(): c for c in novos}.values())
+            supabase.table('clientes').insert(novos_dedup).execute()
             res_clientes = supabase.table('clientes').select('id, nome').execute()
             df_cli_bd = pd.DataFrame(res_clientes.data)
 
         mapa_cli = {str(r['nome']).strip().lower(): int(r['id']) for _, r in df_cli_bd.iterrows()}
 
+        # 2. Status
         res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
         mapa_status = {}
         if res_status and res_status.data:
@@ -119,10 +136,11 @@ def sincronizar_com_supabase(df_bi: pd.DataFrame):
                 mapa_status[str(s['codigo']).strip()] = int(s['id'])
                 mapa_status[f"{s['codigo']}-{s['descricao']}".strip()] = int(s['id'])
 
+        # 3. Pedidos Existentes
         res_pedidos = supabase.table('pedidos').select('id, numero_pedido').execute()
         pedidos_bd = {str(p['numero_pedido']).strip(): p['id'] for p in res_pedidos.data} if res_pedidos and res_pedidos.data else {}
 
-        payload = []
+        payload_dict = {}
         agora = datetime.now().isoformat()
 
         for _, row in df_bi.iterrows():
@@ -150,12 +168,16 @@ def sincronizar_com_supabase(df_bi: pd.DataFrame):
             if ped_str in pedidos_bd:
                 item['id'] = pedidos_bd[ped_str]
 
-            payload.append(item)
+            # Garante unicidade estrita pela chave numero_pedido
+            payload_dict[ped_str] = item
 
+        payload = list(payload_dict.values())
+
+        # Envio em Batches
         for i in range(0, len(payload), 100):
             supabase.table('pedidos').upsert(payload[i:i + 100], on_conflict='numero_pedido').execute()
 
-        st.success("✅ Sincronização concluída com sucesso!")
+        st.success("✅ Sincronização e cruzamento concluídos com sucesso!")
         st.cache_data.clear()
         st.rerun()
 
@@ -267,7 +289,6 @@ def renderizar_controle_logistico(f_base):
         col_nf_nome = 'NF' if 'NF' in df_log.columns else 'Nota Fiscal'
         col_ped_nome = '(WMS) Ped. Orig.' if '(WMS) Ped. Orig.' in df_log.columns else 'Pedido'
 
-        # Filtro estrito: Apenas registros válidos com NF e Pedido
         if col_nf_nome in df_log.columns:
             df_log = df_log[df_log[col_nf_nome].notna() & (df_log[col_nf_nome].astype(str).str.strip() != '') & (df_log[col_nf_nome].astype(str) != 'nan')]
         if col_ped_nome in df_log.columns:
@@ -289,7 +310,6 @@ def renderizar_controle_logistico(f_base):
         else:
             df_log['Dt_Romaneio_Parsed'] = pd.NaT
 
-        # Motor de busca e Filtro por datas
         st.markdown("#### 🔍 Motor de Busca e Filtro por Data de Romaneio")
         col_s1, col_s2 = st.columns([2, 2])
 
@@ -320,7 +340,6 @@ def renderizar_controle_logistico(f_base):
 
         st.markdown("---")
 
-        # Métricas da Aba 2
         m1, m2, m3, m4 = st.columns(4)
         val_total = df_filtrado_log['ValorNF_Clean'].sum()
         transp_count = df_filtrado_log['Transport.'].nunique() if 'Transport.' in df_filtrado_log.columns else 0
@@ -365,7 +384,21 @@ def renderizar_controle_logistico(f_base):
     except Exception as e:
         st.error(f"Erro ao carregar controle logístico: {str(e)}")
 
-# 8. MAIN
+# 8. RODAPÉ INSTITUCIONAL
+def renderizar_rodape():
+    st.markdown("---")
+    ano_atual = datetime.now().year
+    st.markdown(
+        f"""
+        <div class="footer-style">
+            © {ano_atual} <b>{EMPRESA_NOME}</b> — Todos os direitos reservados.<br>
+            <small>Painel de Gestão e Acompanhamento Logístico de Operações</small>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+# 9. MAIN
 def main():
     if os.path.exists(CAMINHO_LOGO):
         st.sidebar.image(CAMINHO_LOGO, use_container_width=True)
@@ -392,7 +425,6 @@ def main():
 
     st.markdown("---")
 
-    # MANTÉM AS DUAS ABAS ATIVAS
     aba_bi, aba_logistica = st.tabs(["📊 BI Operações & Separação", "🚚 Controle Logístico & Entregas"])
 
     with aba_bi:
@@ -419,6 +451,8 @@ def main():
 
     with aba_logistica:
         renderizar_controle_logistico(f_base)
+
+    renderizar_rodape()
 
 if __name__ == "__main__":
     main()
