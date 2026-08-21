@@ -3,6 +3,7 @@ import streamlit as st
 import plotly.express as px
 from supabase import create_client, Client
 import os
+from datetime import datetime
 
 # 1. CONFIGURAÇÃO DA PÁGINA E BRANDING
 
@@ -46,12 +47,12 @@ def iniciar_conexao_supabase() -> Client:
 
 supabase = iniciar_conexao_supabase()
 
-# 3. INJEÇÃO DE DADOS (UPLOAD CSV/EXCEL SEM DUPLICIDADE)
+# 3. INJEÇÃO DE DADOS (UPLOAD CSV/EXCEL SEM DUPLICIDADE & TRATAMENTO DE NOT NULL)
 
 def processar_e_injetar_arquivo(file_upload):
     """
     Lê CSV ou Excel, cadastra clientes e status, remove duplicidades priorizando 
-    registros COM SALDO e sincroniza os pedidos via UPSERT no Supabase.
+    registros COM SALDO, garante valores padrão para campos NOT NULL e sincroniza via UPSERT.
     """
     try:
         nome_arquivo = file_upload.name.lower()
@@ -74,8 +75,12 @@ def processar_e_injetar_arquivo(file_upload):
         col_cliente = cols_lower.get('cliente_nome') or cols_lower.get('cliente')
         col_wms_ped = cols_lower.get('(wms) ped. orig.') or cols_lower.get('pv_limpo') or cols_lower.get('pv')
         col_nf = cols_lower.get('nf') or cols_lower.get('numero_pedido') or cols_lower.get('pedido')
+        
+        # Múltiplos mapeamentos de datas
         col_data = (cols_lower.get('emissão pv_data') or cols_lower.get('emissão pv') or 
-                    cols_lower.get('abertoem') or cols_lower.get('emissao nf'))
+                    cols_lower.get('abertoem') or cols_lower.get('emissao nf') or 
+                    cols_lower.get('(wms) envio sep.') or cols_lower.get('dt. romaneio'))
+        
         col_vol = cols_lower.get('volume') or cols_lower.get('volumes')
         col_saldo = cols_lower.get('possui saldo')
 
@@ -107,8 +112,6 @@ def processar_e_injetar_arquivo(file_upload):
             return
 
         # --- Lógica de Prioridade: Descartar "Sem Saldo" quando houver duplicidade ---
-        # Prioridade 0 = Com Saldo / Válido (Manter)
-        # Prioridade 1 = Sem Saldo (Descartar se houver registro com saldo)
         if col_saldo:
             df['peso_saldo'] = df[col_saldo].astype(str).str.strip().str.lower().apply(
                 lambda x: 1 if any(termo in x for termo in ['não', 'nao', 'f', 'false', '0', 'sem saldo']) else 0
@@ -161,7 +164,7 @@ def processar_e_injetar_arquivo(file_upload):
             novos_clientes = clientes_unicos
 
         if novos_clientes:
-            st.write(f"➕ Cadastrating {len(novos_clientes)} novos clientes...")
+            st.write(f"➕ Cadastrando {len(novos_clientes)} novos clientes...")
             payload_clientes = [{'nome': c} for c in novos_clientes]
             supabase.table('clientes').insert(payload_clientes).execute()
 
@@ -176,6 +179,7 @@ def processar_e_injetar_arquivo(file_upload):
         pedidos_bd_mapa = {p['numero_pedido']: p for p in res_pedidos_existentes.data} if res_pedidos_existentes and res_pedidos_existentes.data else {}
 
         payload_upsert = []
+        data_agora_iso = datetime.now().isoformat()
 
         for _, row in df.iterrows():
             pedido_num = int(row['ped_num_clean'])
@@ -205,9 +209,15 @@ def processar_e_injetar_arquivo(file_upload):
                 if ped_existente.get('status_id') != 1 and s_id == 1:
                     continue
 
+            # --- Tratamento de Data NOT NULL ---
             raw_data = row.get(col_data) if col_data else None
             data_parsed = pd.to_datetime(raw_data, dayfirst=True, errors='coerce')
-            data_iso = data_parsed.strftime('%Y-%m-%dT%H:%M:%S') if pd.notna(data_parsed) else None
+            
+            if pd.notna(data_parsed):
+                data_iso = data_parsed.strftime('%Y-%m-%dT%H:%M:%S')
+            else:
+                # Fallback: Se a data for nula, assume a data/hora atual para respeitar a constraint NOT NULL
+                data_iso = data_agora_iso
 
             raw_vol = row.get(col_vol) if col_vol else 0
             vol_val = pd.to_numeric(raw_vol, errors='coerce')
@@ -221,7 +231,6 @@ def processar_e_injetar_arquivo(file_upload):
                 'volumes': vol_int
             }
 
-            # Se já existir, vincula a PK id para forçar update limpo
             if pedido_num in pedidos_bd_mapa:
                 item_pedido['id'] = pedidos_bd_mapa[pedido_num]['id']
 
@@ -336,7 +345,7 @@ def renderizar_graficos(df: pd.DataFrame, status_ativo: str):
         else:
             st.info("Sem registro de volumes para os pedidos deste status.")
 
-# 6. COMPONENTES VISUAIS - CONTROLE LOGÍSTICO (NOVA ABA)
+# 6. COMPONENTES VISUAIS - CONTROLE LOGÍSTICO
 
 def renderizar_controle_logistico(file_upload):
     st.subheader("🚛 Gestão e Controle Logístico de Entregas")
@@ -353,7 +362,6 @@ def renderizar_controle_logistico(file_upload):
                     file_upload.seek(0)
                     df_log = pd.read_csv(file_upload, encoding='latin1', sep=None, engine='python')
 
-            # Trata valor monetário
             if 'ValorNF.1' in df_log.columns:
                 df_log['ValorNF_Clean'] = df_log['ValorNF.1'].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
                 df_log['ValorNF_Clean'] = pd.to_numeric(df_log['ValorNF_Clean'], errors='coerce').fillna(0)
@@ -428,7 +436,6 @@ def main():
 
     st.markdown("---")
 
-    # Estrutura de Abas para Separar o BI das Operações e a Gestão Logística
     aba_bi, aba_logistica = st.tabs(["📊 BI Operações & Separação", "🚚 Controle Logístico & Entregas"])
 
     with aba_bi:
