@@ -52,7 +52,7 @@ def iniciar_conexao_supabase() -> Client:
 
 supabase = iniciar_conexao_supabase()
 
-# 3. ETL INTEGRADO
+# 3. ETL INTEGRADO (PRESERVANDO REGISTROS DE NOTA FISCAL)
 def executar_etl_bi(file_separacao, file_logistica=None) -> pd.DataFrame:
     try:
         file_separacao.seek(0)
@@ -91,24 +91,20 @@ def executar_etl_bi(file_separacao, file_logistica=None) -> pd.DataFrame:
             df_bi['Cliente_Final'] = 'Cliente Não Identificado'
 
         df_bi['Status_Unificado'] = df_bi['Status'].fillna('10-Ag.Inicio Operação').astype(str).str.strip()
-        
-        # DEDUPLICAÇÃO PARA EVITAR O ERRO ON CONFLICT DO UPDATE
-        df_bi = df_bi.drop_duplicates(subset=['PEDIDO_KEY'], keep='first')
-
         return df_bi
 
     except Exception as e:
         st.error(f"❌ Erro no ETL: {str(e)}")
         return pd.DataFrame()
 
-# 4. INJEÇÃO SUPABASE
+# 4. INJEÇÃO CORRIGIDA NO SUPABASE (SEM 'id' MANUAL)
 def sincronizar_com_supabase(df_bi: pd.DataFrame):
     try:
         if df_bi.empty:
             st.warning("Nenhum dado para sincronizar.")
             return
 
-        # 1. Clientes
+        # 1. Cadastro de Clientes
         clientes_unicos = [str(c).strip() for c in df_bi['Cliente_Final'].dropna().unique() if str(c).strip() != '']
         res_clientes = supabase.table('clientes').select('id, nome').execute()
         df_cli_bd = pd.DataFrame(res_clientes.data) if res_clientes and res_clientes.data else pd.DataFrame(columns=['id', 'nome'])
@@ -120,7 +116,7 @@ def sincronizar_com_supabase(df_bi: pd.DataFrame):
             novos = [{'nome': c} for c in clientes_unicos]
 
         if novos:
-            # Deduplicação no envio dos novos clientes
+            # Deduplicação no envio de clientes
             novos_dedup = list({c['nome'].lower(): c for c in novos}.values())
             supabase.table('clientes').insert(novos_dedup).execute()
             res_clientes = supabase.table('clientes').select('id, nome').execute()
@@ -128,7 +124,7 @@ def sincronizar_com_supabase(df_bi: pd.DataFrame):
 
         mapa_cli = {str(r['nome']).strip().lower(): int(r['id']) for _, r in df_cli_bd.iterrows()}
 
-        # 2. Status
+        # 2. Mapeamento de Status
         res_status = supabase.table('status_separacao').select('id, codigo, descricao').execute()
         mapa_status = {}
         if res_status and res_status.data:
@@ -136,13 +132,10 @@ def sincronizar_com_supabase(df_bi: pd.DataFrame):
                 mapa_status[str(s['codigo']).strip()] = int(s['id'])
                 mapa_status[f"{s['codigo']}-{s['descricao']}".strip()] = int(s['id'])
 
-        # 3. Pedidos Existentes
-        res_pedidos = supabase.table('pedidos').select('id, numero_pedido').execute()
-        pedidos_bd = {str(p['numero_pedido']).strip(): p['id'] for p in res_pedidos.data} if res_pedidos and res_pedidos.data else {}
-
         payload_dict = {}
         agora = datetime.now().isoformat()
 
+        # Montagem do Payload sem a coluna 'id' para evitar o erro 'GENERATED ALWAYS'
         for _, row in df_bi.iterrows():
             ped_str = str(row['PEDIDO_KEY']).strip()
             if not ped_str or ped_str == 'nan':
@@ -165,15 +158,12 @@ def sincronizar_com_supabase(df_bi: pd.DataFrame):
                 'volumes': 1
             }
 
-            if ped_str in pedidos_bd:
-                item['id'] = pedidos_bd[ped_str]
-
-            # Garante unicidade estrita pela chave numero_pedido
+            # Garante apenas um único registro por pedido para o Supabase (ON CONFLICT numero_pedido)
             payload_dict[ped_str] = item
 
         payload = list(payload_dict.values())
 
-        # Envio em Batches
+        # Inserção por lotes (Sem enviar 'id' manual)
         for i in range(0, len(payload), 100):
             supabase.table('pedidos').upsert(payload[i:i + 100], on_conflict='numero_pedido').execute()
 
@@ -269,9 +259,9 @@ def renderizar_graficos(df: pd.DataFrame, status_ativo: str):
         else:
             st.info("Sem registros de volumes.")
 
-# 7. RENDERIZAÇÃO ABA 2 (CONTROLE LOGÍSTICO & ENTREGAS)
+# 7. RENDERIZAÇÃO ABA 2 (CONTROLE LOGÍSTICO & ENTREGAS - PRESERVANDO DUPLICADOS DE NOTAS)
 def renderizar_controle_logistico(f_base):
-    st.subheader("🚚 Gestão e Controle Logístico de Entregas (Somente NFs Emitidas)")
+    st.subheader("🚚 Gestão e Controle Logístico de Entregas (NFs Emitidas)")
 
     if f_base is None:
         st.info("💡 Faça o upload da **Base Principal (`BaseDados.csv`)** na barra lateral para visualizar o fluxo de NFs e Romaneios.")
@@ -289,10 +279,9 @@ def renderizar_controle_logistico(f_base):
         col_nf_nome = 'NF' if 'NF' in df_log.columns else 'Nota Fiscal'
         col_ped_nome = '(WMS) Ped. Orig.' if '(WMS) Ped. Orig.' in df_log.columns else 'Pedido'
 
+        # FILTRAGEM: Apenas registros que possuem número de Nota Fiscal
         if col_nf_nome in df_log.columns:
             df_log = df_log[df_log[col_nf_nome].notna() & (df_log[col_nf_nome].astype(str).str.strip() != '') & (df_log[col_nf_nome].astype(str) != 'nan')]
-        if col_ped_nome in df_log.columns:
-            df_log = df_log[df_log[col_ped_nome].notna() & (df_log[col_ped_nome].astype(str).str.strip() != '') & (df_log[col_ped_nome].astype(str) != 'nan')]
 
         if df_log.empty:
             st.warning("⚠️ Nenhuma Nota Fiscal/Pedido válido encontrado nesta base.")
@@ -377,7 +366,7 @@ def renderizar_controle_logistico(f_base):
                 fig_ent.update_layout(xaxis_title=None, yaxis_title="Qtd NFs")
                 st.plotly_chart(fig_ent, use_container_width=True)
 
-        st.markdown(f"**Detalhamento de Romaneios e Expedição Logística ({len(df_filtrado_log)} NFs registradas)**")
+        st.markdown(f"**Detalhamento de Romaneios e Expedição Logística ({len(df_filtrado_log)} Registros de NFs exibidos na íntegra)**")
         cols_exibicao = [c for c in [col_nf_nome, col_ped_nome, 'Cliente', 'Transport.', 'Dt. Romaneio', 'Dt. Entrega Real', col_v, 'NF. Devolucao', 'Comentario'] if c in df_filtrado_log.columns]
         st.dataframe(df_filtrado_log[cols_exibicao], use_container_width=True, hide_index=True)
 
